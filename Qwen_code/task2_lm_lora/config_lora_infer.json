@@ -5,7 +5,7 @@
   "annotation_file": "/root/autodl-tmp/data/testset2/annotation.json",
   "data_root": "/root/autodl-tmp/data",
   "csv_path": "/root/autodl-tmp/task2_lm_lora/evaluation/metrics.csv",
-  "prompt_text": "Is this image authentic? Answer:",
+  "prompt_text": "Please determine whether this image is Real or Fake. Answer only with Fake or Real.",
   "fake_token": " Fake",
   "real_token": " Real",
   "max_new_tokens": 4,
