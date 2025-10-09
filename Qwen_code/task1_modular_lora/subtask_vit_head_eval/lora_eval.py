@@ -181,6 +181,8 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     set_seed(seed)
     out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = Path(cfg.get("csv_path", out_dir / "eval_results.csv"))
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"[INFO] Loaded config from: {cli_args.config}")
     print(f"[INFO] Testing on: {ann_test}")
@@ -253,8 +255,6 @@ def main():
     # ---------------------------
     import csv
     from datetime import datetime
-
-    csv_path = out_dir / "eval_results.csv"
 
     row = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),

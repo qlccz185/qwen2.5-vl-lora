@@ -1,10 +1,10 @@
 {
   "working_dir": "/root/autodl-tmp/qwen2.5-vl-lora/Qwen_code",
   "model_path": "/root/autodl-tmp/Qwen2.5-VL-7B-Instruct",
-  "lora_checkpoint": "/root/autodl-tmp/outputs_lora_joint/final_trained_heads_5.pt",
+  "lora_checkpoint": "/root/autodl-tmp/task1_modular_lora/training/modular_vit_lora.pt",
   "annotation_file": "/root/autodl-tmp/data/testset2/annotation.json",
   "data_root": "/root/autodl-tmp/data",
-  "csv_path": "/root/autodl-tmp/outputs/full_model_eval/metrics.csv",
+  "csv_path": "/root/autodl-tmp/task1_modular_lora/subtask_full_model_eval/metrics.csv",
   "prompt_text": "请判断这张图像是真实(Real)还是伪造(Fake)，只回答 Fake 或 Real。",
   "fake_token": " Fake",
   "real_token": " Real",
@@ -12,7 +12,10 @@
   "seed": 42,
   "image_size": 448,
   "torch_dtype": "bfloat16",
-  "lora_target_layers": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],
+  "lora_target_layers": [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31
+  ],
   "lora_r": 8,
   "lora_alpha": 16,
   "lora_dropout": 0.05

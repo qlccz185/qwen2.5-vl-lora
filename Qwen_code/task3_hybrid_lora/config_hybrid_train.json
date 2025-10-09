@@ -3,7 +3,7 @@
   "base_model_path": "/root/autodl-tmp/Qwen2.5-VL-7B-Instruct",
   "data_root": "/root/autodl-tmp/data",
   "ann_train": "/root/autodl-tmp/data/trainingset2/train_idx.json",
-  "output_dir": "/root/autodl-tmp/outputs_task3",
+  "output_dir": "/root/autodl-tmp/task3_hybrid_lora/training",
 
   "seed": 42,
   "epochs": 1,
@@ -59,7 +59,7 @@
     }
   },
 
-  "train_log": "task3_train_log.csv",
+  "train_log": "task3_training_metrics.csv",
   "lora_checkpoint": "task3_lora",
   "head_checkpoint": "task3_heads.pt",
   "fusion_checkpoint": "task3_fusion.pt"

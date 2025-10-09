@@ -2,9 +2,9 @@
   "working_dir": "/root/autodl-tmp/qwen2.5-vl-lora/Qwen_code",
   "base_model_path": "/root/autodl-tmp/Qwen2.5-VL-7B-Instruct",
   "torch_dtype": "bfloat16",
-  "train_dataset_path": "/root/autodl-tmp/data/train_dataset_mapped_2000",
+  "train_dataset_path": "/root/autodl-tmp/task2_lm_lora/datasets/train_dataset_mapped",
   "test_dataset": {
-    "annotation_file": "/root/autodl-tmp/data/testset/annotation.json",
+    "annotation_file": "/root/autodl-tmp/data/testset2/annotation.json",
     "data_root": "/root/autodl-tmp/data",
     "dataset_limit": 100,
     "map_kwargs": {
@@ -23,7 +23,7 @@
   "lora_bias": "none",
   "lora_task_type": "CAUSAL_LM",
   "training_args": {
-    "output_dir": "./qwen-vl-lora",
+    "output_dir": "/root/autodl-tmp/task2_lm_lora/training/hf_trainer",
     "per_device_train_batch_size": 1,
     "gradient_accumulation_steps": 16,
     "learning_rate": 0.0002,
@@ -37,5 +37,5 @@
     "disable_tqdm": false,
     "dataloader_num_workers": 0
   },
-  "save_lora_path": "./qwen-vl-lora"
+  "save_lora_path": "/root/autodl-tmp/task2_lm_lora/training/lora_adapter"
 }

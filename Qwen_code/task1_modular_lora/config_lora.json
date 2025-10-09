@@ -3,7 +3,7 @@
   "model_path": "/root/autodl-tmp/Qwen2.5-VL-7B-Instruct",
   "data_root": "/root/autodl-tmp/data",
   "ann_train": "/root/autodl-tmp/data/trainingset2/train_idx.json",
-  "out_dir": "/root/autodl-tmp/outputs_lora_joint",
+  "out_dir": "/root/autodl-tmp/task1_modular_lora/training",
 
   "seed": 42,
   "epochs": 2,
@@ -17,7 +17,10 @@
   "warmup_ratio": 0.05,
   "max_norm": 1.0,
 
-  "lora_target_layers": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],
+  "lora_target_layers": [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31
+  ],
   "lora_r": 8,
   "lora_alpha": 16,
   "lora_dropout": 0.05,
@@ -31,7 +34,6 @@
   "lambda_contrast": 0.01,
   "evi_alpha": 0.5,
 
-  "train_log": "train_log_lora_joint.csv",
-  "final_trained_heads": "final_trained_heads_2_all.pt"
+  "train_log": "training_metrics.csv",
+  "final_trained_heads": "modular_vit_lora.pt"
 }
-

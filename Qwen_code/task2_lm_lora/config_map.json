@@ -9,6 +9,6 @@
     "batch_size": 1,
     "num_proc": 1
   },
-  "batch_output_dir": "/root/autodl-tmp/data/train_map",
-  "final_dataset_path": "/root/autodl-tmp/data/train_dataset_mapped_2000"
+  "batch_output_dir": "/root/autodl-tmp/task2_lm_lora/datasets/batches",
+  "final_dataset_path": "/root/autodl-tmp/task2_lm_lora/datasets/train_dataset_mapped"
 }
