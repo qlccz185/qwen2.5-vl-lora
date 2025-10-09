@@ -1,62 +1,77 @@
-import os
+import argparse
 import json
+import os
 from pathlib import Path
-from PIL import Image
+
 import torch
 from datasets import Dataset, load_from_disk
+from peft import LoraConfig, TaskType, get_peft_model
+from PIL import Image
 from transformers import (
-    Qwen2_5_VLForConditionalGeneration,
-    AutoTokenizer,
     AutoProcessor,
-    TrainingArguments,
+    AutoTokenizer,
+    DataCollatorForSeq2Seq,
+    Qwen2_5_VLForConditionalGeneration,
     Trainer,
-    DataCollatorForSeq2Seq
+    TrainingArguments,
 )
-from peft import LoraConfig, get_peft_model, TaskType
+
 from qwen_vl_utils import process_vision_info
 
-os.chdir("/root/autodl-tmp/qwen2.5-vl-lora")
-print("Current working directory:", os.getcwd())
 
-# -----------------------------
-# 0️⃣ 模型路径
-# -----------------------------
-base_model_path = "Qwen2.5-VL-7B-Instruct"
+def parse_args():
+    parser = argparse.ArgumentParser(description="Fine-tune Qwen2.5-VL with LoRA using configuration file")
+    default_cfg = Path(__file__).with_name("config_lora_trainer.json")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=default_cfg,
+        help="Path to the JSON configuration file.",
+    )
+    return parser.parse_args()
 
-# -----------------------------
-# 1️⃣ 加载模型、tokenizer、processor
-# -----------------------------
-model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    base_model_path,
-    torch_dtype=torch.bfloat16,
-    device_map="auto",
-)
-tokenizer = AutoTokenizer.from_pretrained(base_model_path)
-processor = AutoProcessor.from_pretrained(base_model_path)
 
-# 允许梯度更新
-model.enable_input_require_grads()
+def load_config(config_path: Path) -> dict:
+    with open(config_path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-# -----------------------------
-# 2️⃣ 加载已经 map 好的训练集
-# -----------------------------
-train_dataset = load_from_disk("data/train_dataset_mapped_2000")
 
-# -----------------------------
-# 3️⃣ 读取并处理测试集（保持原来的 map 方法）
-# -----------------------------
-def load_dataset_from_json(annotation_file, data_root):
+def prepare_environment(cfg: dict):
+    working_dir = cfg.get("working_dir")
+    if working_dir:
+        os.chdir(working_dir)
+    print("Current working directory:", os.getcwd())
+
+
+def build_model_and_tools(base_model_path: str, torch_dtype: str | None):
+    dtype = getattr(torch, torch_dtype) if torch_dtype else torch.bfloat16
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        base_model_path,
+        torch_dtype=dtype,
+        device_map="auto",
+    )
+    tokenizer = AutoTokenizer.from_pretrained(base_model_path)
+    processor = AutoProcessor.from_pretrained(base_model_path)
+    model.enable_input_require_grads()
+    return model, tokenizer, processor
+
+
+def load_dataset_from_json(annotation_file: str, data_root: str, dataset_limit: int | None):
     with open(annotation_file, "r", encoding="utf-8") as f:
         annotations = json.load(f)
+
     data_list = []
     for ann in annotations:
         img_path = str(Path(data_root) / ann["image_path"])
         label_text = "Fake" if ann["label"] == 1 else "Real"
         prompt_text = f"Is this image authentic? Answer: {label_text}"
         data_list.append({"image_path": img_path, "prompt": prompt_text, "label_text": label_text})
-    return Dataset.from_list(data_list)
 
-test_dataset = load_dataset_from_json("data/testset/annotation.json", "data").select(range(100))
+    dataset = Dataset.from_list(data_list)
+    if dataset_limit is not None:
+        dataset = dataset.select(range(min(dataset_limit, len(dataset))))
+    return dataset
+
 
 def process_func_safe(examples):
     results = {"input_ids": [], "attention_mask": [], "labels": [], "pixel_values": [], "image_grid_thw": []}
@@ -69,10 +84,13 @@ def process_func_safe(examples):
                 width, height = img.size
 
             messages = [
-                {"role": "user", "content":[
-                    {"type":"image","image":img_path,"resized_height":height,"resized_width":width},
-                    {"type":"text","text":prompt}
-                ]}
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": img_path, "resized_height": height, "resized_width": width},
+                        {"type": "text", "text": prompt},
+                    ],
+                }
             ]
 
             text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -97,76 +115,82 @@ def process_func_safe(examples):
             continue
     return results
 
-test_dataset = test_dataset.map(
-    process_func_safe,
-    batched=True,
-    batch_size=1,
-    num_proc=1,
-    remove_columns=test_dataset.column_names
-)
 
-# -----------------------------
-# 4️⃣ LoRA 配置
-# -----------------------------
-target_modules = []
-for i in [29, 30, 31]:
-    target_modules += [
-        f"visual.blocks.{i}.attn.qkv",
-        f"visual.blocks.{i}.attn.proj",
-        f"visual.blocks.{i}.mlp.gate_proj",
-        f"visual.blocks.{i}.mlp.up_proj",
-        f"visual.blocks.{i}.mlp.down_proj"
-    ]
-target_modules += ["visual.merger.mlp.0", "visual.merger.mlp.2"]
+def build_lora_config(cfg: dict) -> LoraConfig:
+    target_modules = []
+    for block_idx in cfg.get("lora_target_blocks", []):
+        target_modules.extend(
+            [
+                f"visual.blocks.{block_idx}.attn.qkv",
+                f"visual.blocks.{block_idx}.attn.proj",
+                f"visual.blocks.{block_idx}.mlp.gate_proj",
+                f"visual.blocks.{block_idx}.mlp.up_proj",
+                f"visual.blocks.{block_idx}.mlp.down_proj",
+            ]
+        )
 
-lora_config = LoraConfig(
-    r=64,
-    lora_alpha=16,
-    target_modules=target_modules,
-    lora_dropout=0.05,
-    bias="none",
-    task_type=TaskType.CAUSAL_LM
-)
+    target_modules.extend(cfg.get("lora_extra_modules", []))
 
-model = get_peft_model(model, lora_config)
+    task_type_value = cfg.get("lora_task_type", "CAUSAL_LM")
+    task_type = getattr(TaskType, task_type_value)
 
-# -----------------------------
-# 5️⃣ 训练参数
-# -----------------------------
-training_args = TrainingArguments(
-    output_dir="./qwen-vl-lora",
-    per_device_train_batch_size=1,
-    gradient_accumulation_steps=16,
-    learning_rate=2e-4,
-    num_train_epochs=3,
-    fp16=True,
-    logging_steps=10,
-    save_steps=500,
-    save_total_limit=2,
-    dataloader_drop_last=True,
-    report_to="none",
-    disable_tqdm=False,
-    dataloader_num_workers=0
-)
+    return LoraConfig(
+        r=cfg.get("lora_r", 64),
+        lora_alpha=cfg.get("lora_alpha", 16),
+        target_modules=target_modules,
+        lora_dropout=cfg.get("lora_dropout", 0.05),
+        bias=cfg.get("lora_bias", "none"),
+        task_type=task_type,
+    )
 
-# -----------------------------
-# 6️⃣ 创建 Trainer
-# -----------------------------
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=test_dataset,
-    data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer, padding=True),
-)
 
-# -----------------------------
-# 7️⃣ 训练
-# -----------------------------
-trainer.train()
+def main():
+    args = parse_args()
+    cfg = load_config(args.config)
+    prepare_environment(cfg)
 
-# -----------------------------
-# 8️⃣ 保存 LoRA 权重
-# -----------------------------
-model.save_pretrained("./qwen-vl-lora")
+    global tokenizer, processor
+    model, tokenizer, processor = build_model_and_tools(
+        cfg["base_model_path"], cfg.get("torch_dtype")
+    )
+
+    train_dataset = load_from_disk(cfg["train_dataset_path"])
+
+    test_dataset_cfg = cfg.get("test_dataset", {})
+    test_dataset = load_dataset_from_json(
+        test_dataset_cfg["annotation_file"],
+        test_dataset_cfg["data_root"],
+        test_dataset_cfg.get("dataset_limit"),
+    )
+
+    map_kwargs = test_dataset_cfg.get("map_kwargs", {})
+    test_dataset = test_dataset.map(
+        process_func_safe,
+        batched=True,
+        batch_size=map_kwargs.get("batch_size", 1),
+        num_proc=map_kwargs.get("num_proc", 1),
+        remove_columns=test_dataset.column_names,
+    )
+
+    lora_config = build_lora_config(cfg)
+    model = get_peft_model(model, lora_config)
+
+    training_args = TrainingArguments(**cfg["training_args"])
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=test_dataset,
+        data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer, padding=True),
+    )
+
+    trainer.train()
+
+    save_path = cfg.get("save_lora_path", cfg["training_args"].get("output_dir", "./qwen-vl-lora"))
+    model.save_pretrained(save_path)
+
+
+if __name__ == "__main__":
+    main()
 

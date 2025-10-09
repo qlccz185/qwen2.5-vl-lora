@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
-import os, json, torch
+import argparse
+import os
+import json
+import torch
 import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
@@ -16,8 +19,31 @@ from test import (
     set_seed
 )
 
-os.chdir("/root/autodl-tmp/qwen2.5-vl-lora")
-print("Current working directory:", os.getcwd())
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Evaluate Qwen2.5-VL LoRA heads using configuration file",
+    )
+    default_cfg = Path(__file__).with_name("config_eval.json")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=default_cfg,
+        help="Path to the JSON configuration file.",
+    )
+    return parser.parse_args()
+
+
+def load_config(config_path: Path) -> dict:
+    with open(config_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def prepare_environment(cfg: dict):
+    working_dir = cfg.get("working_dir")
+    if working_dir:
+        os.chdir(working_dir)
+    print("Current working directory:", os.getcwd())
 
 # ---------------------------
 # 评估分类性能
@@ -139,26 +165,24 @@ def eval_evidence(model, visual_tap, dl, device, thr_map=0.3, only_fake=True):
 # Main entry
 # ---------------------------
 def main():
-    # ---------------------------
-    # 1️⃣ 读取配置文件
-    # ---------------------------
-    config_path = "/root/autodl-tmp/Qwen_code/config_eval.json"
-    with open(config_path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
+    cli_args = parse_args()
+    cfg = load_config(cli_args.config)
+    prepare_environment(cfg)
 
     ckpt_path = cfg["ckpt_path"]
     model_path = cfg["model_path"]
     ann_test = cfg["ann_test"]
     data_root = cfg["data_root"]
-    out_dir = cfg["out_dir"]
+    out_dir = Path(cfg.get("out_dir", "./outputs"))
     batch_size = cfg.get("batch_size", 8)
     num_workers = cfg.get("num_workers", 4)
+    seed = cfg.get("seed", 42)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    set_seed(42)
-    os.makedirs(out_dir, exist_ok=True)
+    set_seed(seed)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[INFO] Loaded config from: {config_path}")
+    print(f"[INFO] Loaded config from: {cli_args.config}")
     print(f"[INFO] Testing on: {ann_test}")
 
     # ---------------------------
@@ -179,8 +203,14 @@ def main():
     # 3️⃣ 模型
     # ---------------------------
     print("Loading Qwen and LoRA...")
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    dtype_name = cfg.get("torch_dtype")
+    if dtype_name:
+        dtype = getattr(torch, dtype_name)
     qwen = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        model_path, device_map="auto", torch_dtype=torch.bfloat16
+        model_path,
+        device_map="auto",
+        torch_dtype=dtype,
     )
     for p in qwen.parameters():
         p.requires_grad = False
@@ -188,23 +218,24 @@ def main():
 
     # ✅ 先注入 LoRA 模块（与训练时相同方式）
     ckpt = torch.load(ckpt_path, map_location="cpu")
-    args = ckpt.get("args", {})  # 从 ckpt 中恢复超参数（如果有存）
+    ckpt_args = ckpt.get("args", {})  # 从 ckpt 中恢复超参数（如果有存）
 
     from lora_train import build_lora_on_qwen_visual  
     qwen.visual = build_lora_on_qwen_visual(
         qwen.visual,
-        r=args.get("lora_r", 8),
-        alpha=args.get("lora_alpha", 16),
-        dropout=args.get("lora_dropout", 0.05),
-        target_layers=args.get("lora_target_layers", [7, 15, 23, 31])
+        r=ckpt_args.get("lora_r", cfg.get("lora_r", 8)),
+        alpha=ckpt_args.get("lora_alpha", cfg.get("lora_alpha", 16)),
+        dropout=ckpt_args.get("lora_dropout", cfg.get("lora_dropout", 0.05)),
+        target_layers=ckpt_args.get("lora_target_layers", cfg.get("lora_target_layers", [7, 15, 23, 31])),
     )
 
     # ✅ 再加载 LoRA 权重
     qwen.visual.load_state_dict(ckpt["visual_lora"], strict=False)
 
     # 头部网络
-    visual_tap = QwenVisualTap(qwen.visual, layers=(7, 15, 23, 31)).to(device)
-    heads = ForensicJoint(fuse_in_ch=1280, fuse_out_ch=512, layers=(7, 15, 23, 31)).to(device)
+    visual_layers = tuple(cfg.get("visual_layers", [7, 15, 23, 31]))
+    visual_tap = QwenVisualTap(qwen.visual, layers=visual_layers).to(device)
+    heads = ForensicJoint(fuse_in_ch=1280, fuse_out_ch=512, layers=visual_layers).to(device)
     heads.load_state_dict(ckpt["state_dict"], strict=False)
 
     print("✅ LoRA weights loaded successfully!\n")
@@ -223,7 +254,7 @@ def main():
     import csv
     from datetime import datetime
 
-    csv_path = Path(out_dir) / "eval_results.csv"
+    csv_path = out_dir / "eval_results.csv"
 
     row = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),

@@ -1,0 +1,13 @@
+{
+  "working_dir": "/root/autodl-tmp/qwen2.5-vl-lora/Qwen_code",
+  "base_model_path": "/root/autodl-tmp/Qwen2.5-VL-7B-Instruct",
+  "lora_path": "/root/autodl-tmp/qwen2.5-vl-lora/Qwen_code/qwen-vl-lora",
+  "annotation_file": "/root/autodl-tmp/data/testset2/annotation.json",
+  "data_root": "/root/autodl-tmp/data",
+  "csv_path": "/root/autodl-tmp/outputs/lora_infer_metrics.csv",
+  "prompt_text": "Is this image authentic? Answer:",
+  "fake_token": " Fake",
+  "real_token": " Real",
+  "max_new_tokens": 4,
+  "torch_dtype": "bfloat16"
+}
