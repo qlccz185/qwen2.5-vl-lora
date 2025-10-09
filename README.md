@@ -1,7 +1,7 @@
 # Qwen2.5-VL LoRA Pipelines
 
 将本项目使用git clone 到/root/autodl-tmp下，在/root/autodl-tmp下需要有data文件和Qwen2.5-VL-7B-Instruct文件。其中data文件中的文件格式是这样的：
-
+![图片](image.png)
 
 本仓库围绕 Qwen2.5-VL 搭建了三条 LoRA 训练/评估流程。所有训练得到的模型参数与评估 CSV 日志均按照任务划分保存在 `/root/autodl-tmp` 下的三个目录：
 
