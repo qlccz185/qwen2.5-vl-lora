@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
-import os, json, math, time
+import argparse
+import os
+import json
+import math
 from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,6 +15,7 @@ from transformers import (
     Qwen2_5_VLForConditionalGeneration,
     get_cosine_schedule_with_warmup,
 )
+
 from test import (
     ForgeryJointValDataset,
     collate_joint_test,
@@ -20,8 +25,31 @@ from test import (
 )
 from peft import LoraConfig, get_peft_model
 
-os.chdir("/root/autodl-tmp/qwen2.5-vl-lora")
-print("Current working directory:", os.getcwd())
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Fine-tune Qwen2.5-VL forensic heads with LoRA using configuration file",
+    )
+    default_cfg = Path(__file__).with_name("config_lora.json")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=default_cfg,
+        help="Path to the JSON configuration file.",
+    )
+    return parser.parse_args()
+
+
+def load_config(config_path: Path) -> dict:
+    with open(config_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def prepare_environment(cfg: dict):
+    working_dir = cfg.get("working_dir")
+    if working_dir:
+        os.chdir(working_dir)
+    print("Current working directory:", os.getcwd())
 # --------------------------
 # LoRA utility
 # --------------------------
@@ -178,60 +206,82 @@ def train_one_epoch(
 # Main
 # --------------------------
 def main():
-    CONFIG_PATH = "/root/autodl-tmp/Qwen_code/config_lora.json"
-    with open(CONFIG_PATH, "r") as f:
-        args = json.load(f)
+    cli_args = parse_args()
+    cfg = load_config(cli_args.config)
+    prepare_environment(cfg)
 
-    set_seed(args["seed"])
-    os.makedirs(args["out_dir"], exist_ok=True)
+    set_seed(cfg.get("seed", 42))
+    out_dir = Path(cfg["out_dir"]) if "out_dir" in cfg else Path("outputs")
+    out_dir.mkdir(parents=True, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    processor = AutoProcessor.from_pretrained(args["model_path"], local_files_only=True)
-    ds_train = ForgeryJointValDataset(args["ann_train"], data_root=args["data_root"])
+    processor = AutoProcessor.from_pretrained(cfg["model_path"], local_files_only=True)
+    ds_train = ForgeryJointValDataset(cfg["ann_train"], data_root=cfg["data_root"])
     dl_train = DataLoader(
-        ds_train, batch_size=args["batch_size"], shuffle=True,
-        num_workers=args["num_workers"], pin_memory=True,
-        collate_fn=lambda b: collate_joint_test(b, processor, args["image_size"]),
+        ds_train,
+        batch_size=cfg.get("batch_size", 1),
+        shuffle=True,
+        num_workers=cfg.get("num_workers", 0),
+        pin_memory=True,
+        collate_fn=lambda b: collate_joint_test(b, processor, cfg.get("image_size", 448)),
         drop_last=True,
     )
 
     # model
+    base_dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    dtype_name = cfg.get("torch_dtype") or cfg.get("model_dtype")
+    if dtype_name:
+        base_dtype = getattr(torch, dtype_name)
+
     qwen = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        args["model_path"],
-        torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
-        device_map="auto"
+        cfg["model_path"],
+        torch_dtype=base_dtype,
+        device_map="auto",
     )
     for p in qwen.parameters():
         p.requires_grad = False
     qwen.eval()
 
     qwen.visual = build_lora_on_qwen_visual(
-        qwen.visual, r=args["lora_r"], alpha=args["lora_alpha"], dropout=args["lora_dropout"], target_layers=args.get("lora_target_layers", [7, 15, 23, 31])
+        qwen.visual,
+        r=cfg.get("lora_r", 8),
+        alpha=cfg.get("lora_alpha", 16),
+        dropout=cfg.get("lora_dropout", 0.05),
+        target_layers=cfg.get("lora_target_layers", [7, 15, 23, 31]),
     )
     qwen.visual.train()
-    visual_tap = QwenVisualTap(qwen.visual, layers=(7, 15, 23, 31)).to(device)
-    heads = ForensicJoint(fuse_in_ch=1280, fuse_out_ch=512, layers=(7, 15, 23, 31)).to(device)
+    visual_layers = tuple(cfg.get("visual_layers", [7, 15, 23, 31]))
+    visual_tap = QwenVisualTap(qwen.visual, layers=visual_layers).to(device)
+    heads = ForensicJoint(fuse_in_ch=1280, fuse_out_ch=512, layers=visual_layers).to(device)
 
     # optimizer
     head_params = [p for p in heads.parameters() if p.requires_grad]
     lora_params = [p for p in visual_tap.parameters() if p.requires_grad]
-    steps_per_epoch = math.ceil(len(dl_train) / max(1, args["grad_accum"]))
-    total_steps = args["epochs"] * steps_per_epoch
-    warmup_steps = int(total_steps * args["warmup_ratio"])
+    grad_accum = cfg.get("grad_accum", 1)
+    epochs = cfg.get("epochs", 1)
+    warmup_ratio = cfg.get("warmup_ratio", 0.0)
+    steps_per_epoch = math.ceil(len(dl_train) / max(1, grad_accum))
+    total_steps = max(1, epochs * steps_per_epoch)
+    warmup_steps = int(total_steps * warmup_ratio)
 
-    optimizer = torch.optim.AdamW([
-        {"params": head_params, "lr": args["lr_head"], "weight_decay": args["weight_decay"]},
-        {"params": lora_params, "lr": args["lr_lora"], "weight_decay": 0.0},
-    ])
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": head_params, "lr": cfg.get("lr_head", 1e-3), "weight_decay": cfg.get("weight_decay", 0.0)},
+            {"params": lora_params, "lr": cfg.get("lr_lora", 1e-4), "weight_decay": 0.0},
+        ]
+    )
     scheduler = get_cosine_schedule_with_warmup(
-        optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps,
     )
 
     # AMP setup
-    if args["amp_dtype"] == "bf16":
+    amp_mode = str(cfg.get("amp_dtype", "bf16")).lower()
+    if amp_mode == "bf16":
         amp_dtype = torch.bfloat16
         scaler = None
-    elif args["amp_dtype"] == "fp16":
+    elif amp_mode == "fp16":
         amp_dtype = torch.float16
         scaler = torch.cuda.amp.GradScaler()
     else:
@@ -241,19 +291,21 @@ def main():
     # 🔹 创建日志 CSV 文件
     import csv
     from datetime import datetime
-    csv_path = Path(args["out_dir"]) / args["train_log"]
+
+    csv_path = out_dir / cfg.get("train_log", "train_log_lora_joint.csv")
     file_exists = csv_path.exists()
     with open(csv_path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=[
-            "timestamp", "epoch", "loss", "cls", "evi", "sparse", "contrast"
-        ])
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["timestamp", "epoch", "loss", "cls", "evi", "sparse", "contrast"],
+        )
         if not file_exists:
             writer.writeheader()
 
     # train loop
     print("\n=== Start Training (No Eval) ===")
-    for epoch in range(1, args["epochs"] + 1):
-        print(f"\nEpoch {epoch}/{args['epochs']}")
+    for epoch in range(1, epochs + 1):
+        print(f"\nEpoch {epoch}/{epochs}")
 
         stats = train_one_epoch(
             visual_tap,
@@ -263,16 +315,18 @@ def main():
             optimizer,
             scheduler,
             scaler,
-            evi_alpha=args["evi_alpha"],
-            lambda_evi=args["lambda_evi"],
-            lambda_sparse=args["lambda_sparse"],
-            lambda_contrast=args["lambda_contrast"],
-            grad_accum=args["grad_accum"],
-            max_norm=args["max_norm"],
+            evi_alpha=cfg.get("evi_alpha", 0.5),
+            lambda_evi=cfg.get("lambda_evi", 2.0),
+            lambda_sparse=cfg.get("lambda_sparse", 1e-3),
+            lambda_contrast=cfg.get("lambda_contrast", 1e-2),
+            grad_accum=grad_accum,
+            max_norm=cfg.get("max_norm", 1.0),
             amp_dtype=amp_dtype,
         )
 
-        print(f"Epoch {epoch} done | loss={stats['loss']:.4f} cls={stats['cls']:.4f} evi={stats['evi']:.4f}")
+        print(
+            f"Epoch {epoch} done | loss={stats['loss']:.4f} cls={stats['cls']:.4f} evi={stats['evi']:.4f}"
+        )
 
         # 🔹 将结果追加写入 CSV
         row = {
@@ -282,20 +336,23 @@ def main():
             "cls": stats["cls"],
             "evi": stats["evi"],
             "sparse": stats["sparse"],
-            "contrast": stats["contrast"]
+            "contrast": stats["contrast"],
         }
         with open(csv_path, "a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=list(row.keys()))
             writer.writerow(row)
 
     # save model at end
-    save_path = Path(args["out_dir"]) / args['final_trained_heads']
-    torch.save({
-        "epoch": args["epochs"],
-        "state_dict": heads.state_dict(),
-        "visual_lora": qwen.visual.state_dict(),
-        "args": args,
-    }, save_path)
+    save_path = out_dir / cfg.get("final_trained_heads", "final_trained_heads.pt")
+    torch.save(
+        {
+            "epoch": epochs,
+            "state_dict": heads.state_dict(),
+            "visual_lora": qwen.visual.state_dict(),
+            "args": cfg,
+        },
+        save_path,
+    )
     print(f"[SAVE] Model saved to {save_path}")
 
 if __name__ == "__main__":
