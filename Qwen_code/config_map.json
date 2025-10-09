@@ -1,0 +1,14 @@
+{
+  "working_dir": "/root/autodl-tmp/qwen2.5-vl-lora",
+  "base_model_path": "Qwen2.5-VL-7B-Instruct",
+  "annotation_file": "data/trainingset2/annotation.json",
+  "data_root": "data",
+  "dataset_limit": 2000,
+  "map_batch_size": 50,
+  "map_kwargs": {
+    "batch_size": 1,
+    "num_proc": 1
+  },
+  "batch_output_dir": "data/train_map",
+  "final_dataset_path": "data/train_dataset_mapped_2000"
+}
