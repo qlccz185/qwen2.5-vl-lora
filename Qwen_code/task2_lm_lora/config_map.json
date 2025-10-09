@@ -3,7 +3,6 @@
   "base_model_path": "/root/autodl-tmp/Qwen2.5-VL-7B-Instruct",
   "annotation_file": "/root/autodl-tmp/data/trainingset2/annotation.json",
   "data_root": "/root/autodl-tmp/data",
-  "dataset_limit": 2000,
   "map_batch_size": 50,
   "map_kwargs": {
     "batch_size": 1,

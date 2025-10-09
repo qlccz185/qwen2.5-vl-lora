@@ -51,7 +51,7 @@ def load_dataset_from_json(annotation_file: str, data_root: str, dataset_limit: 
     for ann in annotations:
         img_path = str(Path(data_root) / ann["image_path"])
         label_text = "Fake" if ann["label"] == 1 else "Real"
-        prompt_text = f"Is this image authentic? Answer: {label_text}"
+        prompt_text = f"Please determine whether this image is Real or Fake. Answer only with Fake or Real. Answer: {label_text}"
         data_list.append({"image_path": img_path, "prompt": prompt_text, "label_text": label_text})
 
     dataset = Dataset.from_list(data_list)
