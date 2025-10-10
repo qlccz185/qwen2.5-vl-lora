@@ -7,16 +7,21 @@
   "data_root": "/root/autodl-tmp/data",
   "annotation_file": "/root/autodl-tmp/data/testset2/annotation.json",
   "csv_path": "/root/autodl-tmp/task3_hybrid_lora/evaluation/metrics.csv",
-
   "seed": 42,
   "batch_size": 2,
   "num_workers": 2,
   "image_size": 448,
   "torch_dtype": "bfloat16",
-  "visual_layers": [7, 15, 23, 31],
+  "visual_layers": [
+    7,
+    15,
+    23,
+    31
+  ],
   "fusion_tokens": 4,
-
   "prompt": "请判断这张图像是真实(Real)还是伪造(Fake)，只回答 Fake 或 Real。",
   "fake_token": " Fake",
-  "real_token": " Real"
+  "real_token": " Real",
+  "output_json": "/root/autodl-tmp/task3_hybrid_lora/evaluation/inference_results.json",
+  "mapped_dataset_path": "/root/autodl-tmp/qwen2.5-vl-lora/Qwen_code/datasets/test_dataset_mapped"
 }
