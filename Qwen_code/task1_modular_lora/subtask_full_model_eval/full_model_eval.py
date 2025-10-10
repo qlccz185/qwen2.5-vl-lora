@@ -223,7 +223,7 @@ def evaluate_samples(
         with torch.no_grad():
             outputs = model.generate(**inputs, **generation_kwargs)
 
-        logits = outputs.scores[-1][0].to(torch.float32)
+        logits = outputs.scores[0][0].to(torch.float32)
         fake_prob, real_prob = compute_probs_from_scores(logits, fake_token_id, real_token_id)
         new_tokens = outputs.sequences[:, inputs["input_ids"].shape[-1]:]
         generated_text = tokenizer.decode(new_tokens[0], skip_special_tokens=True).strip()
@@ -292,24 +292,35 @@ def main() -> None:
 
     device = next(model.parameters()).device
 
+    # 🔹 模型推理与指标计算
     y_true, y_prob_fake, generations = evaluate_samples(model, processor, tokenizer, samples, cfg, device)
     auroc, acc, f1 = compute_metrics(y_true, y_prob_fake)
 
     print("[METRICS] AUROC={:.4f} ACC={:.4f} F1={:.4f}".format(auroc, acc, f1))
     append_metrics_to_csv(cfg, (auroc, acc, f1), len(samples))
 
-    details_path = Path(cfg.csv_path).with_suffix(".details.jsonl")
-    with details_path.open("a", encoding="utf-8") as f:
-        for label, prob_fake, gen in zip(y_true.tolist(), y_prob_fake.tolist(), generations):
-            record = {
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "image_label": int(label),
-                "fake_probability": float(prob_fake),
-                "generated_text": gen,
-            }
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-    print(f"[LOG] Detailed generations appended to {details_path}")
+    # ============================================================
+    # 🔹 读取输出文件名：从 config 中获取（默认 inference_results.json）
+    # ============================================================
+    output_name = getattr(cfg, "output_json", None) or "inference_results.json"
+    infer_result_path = Path(cfg.csv_path).with_name(output_name)
 
+    # 🔹 收集所有样本结果
+    all_records = []
+    for rec, prob_fake, gen in zip(samples, y_prob_fake.tolist(), generations):
+        record = {
+            "image_path": rec.get("path") or rec.get("image_path"),
+            "image_label": int(rec.get("label", 0)),
+            "fake_probability": float(prob_fake),
+            "generated_text": gen,
+        }
+        all_records.append(record)
+
+    # 🔹 保存为 JSON 文件
+    with infer_result_path.open("w", encoding="utf-8") as f:
+        json.dump(all_records, f, ensure_ascii=False, indent=2)
+
+    print(f"[LOG] Inference results saved to {infer_result_path}")
 
 if __name__ == "__main__":
     main()
