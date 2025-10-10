@@ -49,10 +49,6 @@
       "blocks": [7, 15, 23, 31],
       "extra_patterns": ["visual.proj", "visual.attn"]
     },
-    "merge": {
-      "enabled": true,
-      "module_patterns": ["multi_modal_projector", "vision_tower.mlp"]
-    },
     "lm": {
       "enabled": true,
       "module_patterns": ["model.layers", "lm_head"]

@@ -2,7 +2,7 @@
   "working_dir": "/root/autodl-tmp/qwen2.5-vl-lora/Qwen_code",
   "base_model_path": "/root/autodl-tmp/Qwen2.5-VL-7B-Instruct",
   "torch_dtype": "bfloat16",
-  "train_dataset_path": "/root/autodl-tmp/qwen2.5-vl-lora/Qwen_code/datasets/train_dataset_mapped",
+  "train_dataset_path": "/root/autodl-tmp/data/train_dataset_mapped",
   "lora_target_blocks": [
     7,
     15,

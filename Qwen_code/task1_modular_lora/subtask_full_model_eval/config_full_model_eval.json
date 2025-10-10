@@ -8,7 +8,7 @@
   "prompt_text": "Please determine whether this image is Real or Fake. Answer only with Fake or Real.",
   "fake_token": " Fake",
   "real_token": " Real",
-  "max_new_tokens": 1,
+  "max_new_tokens": 4,
   "seed": 42,
   "image_size": 448,
   "torch_dtype": "bfloat16",

@@ -9,6 +9,6 @@
   "max_new_tokens": 1,
   "torch_dtype": "bfloat16",
   "output_json": "/root/autodl-tmp/task2_lm_lora/evaluation/inference_results.json",
-  "mapped_dataset_path": "/root/autodl-tmp/qwen2.5-vl-lora/Qwen_code/datasets/test_dataset_mapped",
+  "mapped_dataset_path": "/root/autodl-tmp/data/test_dataset_mapped",
   "dataset_name": "test_dataset_mapped"
 }
