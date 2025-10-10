@@ -11,12 +11,13 @@ from pathlib import Path
 
 def parse_args() -> argparse.Namespace:
     base_dir = Path(__file__).resolve().parent
+    repo_root = base_dir.parent
     parser = argparse.ArgumentParser(description="Run Task2 dataset mapping, training, and inference")
     parser.add_argument(
         "--map-config",
         type=Path,
-        default=base_dir / "config_map.json",
-        help="Configuration for dataset preprocessing",
+        default=repo_root / "config_dataset_map.json",
+        help="Configuration for the shared dataset preprocessing step",
     )
     parser.add_argument(
         "--train-config",
@@ -48,10 +49,11 @@ def run_step(description: str, command: list[str]) -> None:
 def main() -> None:
     args = parse_args()
     base_dir = Path(__file__).resolve().parent
+    repo_root = base_dir.parent
 
     run_step(
         "Mapping datasets for Task2",
-        [args.python, str(base_dir / "map.py"), "--config", str(args.map_config.resolve())],
+        [args.python, str(repo_root / "dataset_map.py"), "--config", str(args.map_config.resolve())],
     )
 
     run_step(

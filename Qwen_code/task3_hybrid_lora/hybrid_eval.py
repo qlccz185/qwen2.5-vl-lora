@@ -12,7 +12,9 @@ from typing import Dict, Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from datasets import load_from_disk
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from peft import PeftModel
@@ -130,11 +132,77 @@ def build_modules(model, cfg: Dict, device):
     return visual_tap, heads, fusion_projector
 
 
+def _parse_size_str(value: str | None):
+    if not value or not isinstance(value, str):
+        return None
+    lower = value.lower()
+    if "x" not in lower:
+        return None
+    try:
+        h_str, w_str = lower.split("x")
+        return int(h_str), int(w_str)
+    except (TypeError, ValueError):
+        return None
+
+
+class MappedForgeryDataset(Dataset):
+    def __init__(self, hf_dataset, default_root: str | None = None):
+        self.dataset = hf_dataset
+        self.default_root = Path(default_root).resolve() if default_root else None
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index: int):
+        rec = self.dataset[index]
+        image_path = Path(rec.get("image_path", rec.get("path", ""))).expanduser().resolve()
+        image = Image.open(image_path).convert("RGB")
+
+        label = int(rec.get("label", rec.get("image_label", 0)))
+        mask = None
+
+        mask_ref = rec.get("mask_ref") or rec.get("mask_path")
+        mask_resolved = rec.get("mask_path_resolved")
+
+        if label == 1:
+            candidate = None
+            if mask_resolved:
+                candidate = Path(mask_resolved)
+            elif mask_ref and not _parse_size_str(mask_ref):
+                candidate = Path(mask_ref)
+                if not candidate.is_absolute() and self.default_root:
+                    candidate = self.default_root / candidate
+            if candidate and candidate.exists():
+                mask = Image.open(candidate).convert("L")
+        else:
+            mask_size = rec.get("mask_size")
+            if isinstance(mask_size, (list, tuple)) and len(mask_size) == 2:
+                height, width = int(mask_size[0]), int(mask_size[1])
+            else:
+                size = _parse_size_str(mask_ref)
+                if size is None:
+                    width, height = image.size
+                    size = (height, width)
+                height, width = int(size[0]), int(size[1])
+            mask = Image.new("L", (width, height), 0)
+
+        return {"image": image, "label": label, "mask": mask, "path": str(image_path)}
+
+
 def build_dataloader(processor, cfg: Dict) -> DataLoader:
-    dataset = ForgeryJointValDataset(cfg["annotation_file"], data_root=cfg.get("data_root"))
+    mapped_path = cfg.get("mapped_dataset_path")
     batch_size = cfg.get("batch_size", 2)
     num_workers = cfg.get("num_workers", 2)
     image_size = cfg.get("image_size", 448)
+
+    if mapped_path:
+        hf_dataset = load_from_disk(mapped_path)
+        dataset_limit = cfg.get("dataset_limit")
+        if dataset_limit is not None:
+            hf_dataset = hf_dataset.select(range(min(int(dataset_limit), len(hf_dataset))))
+        dataset = MappedForgeryDataset(hf_dataset, default_root=cfg.get("data_root"))
+    else:
+        dataset = ForgeryJointValDataset(cfg["annotation_file"], data_root=cfg.get("data_root"))
 
     return DataLoader(
         dataset,
@@ -164,7 +232,7 @@ def first_token_id(tokenizer, text: str) -> int:
     return ids[0]
 
 
-def evaluate(cfg: Dict):
+def evaluate(cfg: Dict) -> tuple[Dict, list[dict]]:
     prepare_environment(cfg)
     model, processor, tokenizer, device = load_model(cfg)
     visual_tap, heads, fusion_projector = build_modules(model, cfg, device)
@@ -176,10 +244,11 @@ def evaluate(cfg: Dict):
 
     all_probs = []
     all_labels = []
+    records: list[dict] = []
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Eval", dynamic_ncols=True):
-            inputs, labels, masks = batch[0], batch[1], batch[2]
+            inputs, labels, masks, paths, _ = batch
             inputs = {k: v.to(device) for k, v in inputs.items()}
             labels = labels.to(device)
 
@@ -214,8 +283,20 @@ def evaluate(cfg: Dict):
             next_token_logits = logits[:, fusion_tokens + prompt_len - 1, :]
             probs = torch.softmax(next_token_logits[:, [fake_token, real_token]], dim=-1)
             fake_prob = probs[:, 0].detach().cpu()
+            labels_cpu = labels.detach().cpu()
             all_probs.append(fake_prob)
-            all_labels.append(labels.detach().cpu())
+            all_labels.append(labels_cpu)
+
+            prob_np = fake_prob.numpy()
+            label_np = labels_cpu.numpy().astype(int)
+            pred_np = (prob_np >= 0.5).astype(int)
+            for path, label_val, prob_val, pred_val in zip(paths, label_np, prob_np, pred_np):
+                records.append({
+                    "image_path": str(path),
+                    "image_label": int(label_val),
+                    "fake_probability": float(prob_val),
+                    "predicted_label": int(pred_val),
+                })
 
     y_prob = torch.cat(all_probs).numpy()
     y_true = torch.cat(all_labels).numpy().astype(int)
@@ -229,7 +310,10 @@ def evaluate(cfg: Dict):
 
     metrics = {"timestamp": datetime.utcnow().isoformat(), "auroc": auroc, "acc": acc, "f1": f1}
     print("Evaluation metrics:", metrics)
+    return metrics, records
 
+
+def append_metrics_to_csv(cfg: Dict, metrics: Dict) -> Path:
     csv_path = Path(cfg.get("csv_path", "task3_eval_metrics.csv"))
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     file_exists = csv_path.exists()
@@ -238,12 +322,20 @@ def evaluate(cfg: Dict):
         if not file_exists:
             writer.writeheader()
         writer.writerow(metrics)
+    return csv_path
 
 
 def main():
     args = parse_args()
     cfg = load_config(args.config)
-    evaluate(cfg)
+    metrics, records = evaluate(cfg)
+    csv_path = append_metrics_to_csv(cfg, metrics)
+    output_name = cfg.get("output_json", "inference_results.json")
+    inference_path = csv_path.with_name(output_name)
+    with inference_path.open("w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+    print(f"Metrics appended to {csv_path}")
+    print(f"Inference results saved to {inference_path}")
 
 
 if __name__ == "__main__":

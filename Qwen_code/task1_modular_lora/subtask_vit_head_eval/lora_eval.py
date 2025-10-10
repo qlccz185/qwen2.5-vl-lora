@@ -52,6 +52,7 @@ def prepare_environment(cfg: dict):
 def eval_classification(model, visual_tap, dl, device, thr_cls=0.5):
     model.eval(); visual_tap.eval()
     all_y, all_p = [], []
+    sample_records = []
     for batch in tqdm(dl, desc="Eval/Cls"):
         if len(batch) == 5:
             (inputs, labels, masks, paths, _) = batch
@@ -63,18 +64,33 @@ def eval_classification(model, visual_tap, dl, device, thr_cls=0.5):
         grids = visual_tap(inputs["pixel_values"], inputs["image_grid_thw"])
         grids = {k: v.float() for k, v in grids.items()}
         logits, _ = model(grids)
-        prob = torch.sigmoid(logits).cpu().numpy()
-        all_y.append(labels.cpu().numpy())
+        logits = logits.squeeze(-1)
+        prob = torch.sigmoid(logits).detach().cpu().numpy()
+        logits_np = logits.detach().cpu().numpy()
+        labels_np = labels.detach().cpu().numpy()
+
+        all_y.append(labels_np)
         all_p.append(prob)
+
+        preds = (prob >= thr_cls).astype(int)
+        for path, label_val, prob_val, logit_val, pred_val in zip(paths, labels_np, prob, logits_np, preds):
+            sample_records.append({
+                "image_path": str(path),
+                "image_label": int(label_val),
+                "fake_probability": float(prob_val),
+                "predicted_label": int(pred_val),
+                "classification_logit": float(logit_val),
+            })
     y_true = np.concatenate(all_y).astype(np.int64)
     y_prob = np.concatenate(all_p)
     y_pred = (y_prob >= thr_cls).astype(int)
 
-    return {
+    metrics = {
         "auroc": float(roc_auc_score(y_true, y_prob)),
         "acc": float(accuracy_score(y_true, y_pred)),
         "f1": float(f1_score(y_true, y_pred)),
     }
+    return metrics, sample_records
 
 # ---------------------------
 # 评估伪造区域 IoU / Dice
@@ -84,6 +100,7 @@ def eval_evidence(model, visual_tap, dl, device, thr_map=0.3, only_fake=True):
     model.eval(); visual_tap.eval()
     inter_sum = union_sum = 0.0
     dice_n = dice_d = 0.0
+    sample_records = []
     for batch in tqdm(dl, desc="Eval/Evi"):
         if len(batch) == 5:
             (inputs, labels, masks, paths, _) = batch
@@ -103,11 +120,19 @@ def eval_evidence(model, visual_tap, dl, device, thr_map=0.3, only_fake=True):
         prob64 = F.interpolate(prob32, size=(Ht*2, Wt*2), mode="bilinear", align_corners=False)
         gt64 = F.interpolate(masks.unsqueeze(1).float(), size=(Ht*2, Wt*2), mode="bilinear", align_corners=False)
 
+        labels_np = labels.detach().cpu().numpy()
+        paths_list = list(paths)
+
         if only_fake:
             idx = (labels > 0.5).view(-1)
             if not idx.any():
                 continue
             prob64, gt64 = prob64[idx], gt64[idx]
+            labels_np = labels_np[idx.cpu().numpy()]
+            paths_list = [p for p, keep in zip(paths_list, idx.cpu().tolist()) if keep]
+
+        prob64 = prob64.detach()
+        gt64 = gt64.detach()
 
         pred = (prob64 >= thr_map).float()
         gt = (gt64 >= thr_map).float()
@@ -122,10 +147,26 @@ def eval_evidence(model, visual_tap, dl, device, thr_map=0.3, only_fake=True):
         dice_n += dice_num
         dice_d += dice_den
 
-    return {
+        pred_cpu = pred.cpu()
+        gt_cpu = gt.cpu()
+        labels_list = labels_np.tolist() if isinstance(labels_np, np.ndarray) else list(labels_np)
+        for idx_sample, path in enumerate(paths_list):
+            inter_s = (pred_cpu[idx_sample] * gt_cpu[idx_sample]).sum().item()
+            union_s = (pred_cpu[idx_sample] + gt_cpu[idx_sample] - pred_cpu[idx_sample] * gt_cpu[idx_sample]).sum().item() + 1e-6
+            dice_num_s = 2 * inter_s
+            dice_den_s = pred_cpu[idx_sample].sum().item() + gt_cpu[idx_sample].sum().item() + 1e-6
+            sample_records.append({
+                "image_path": str(path),
+                "image_label": int(labels_list[idx_sample]) if labels_list else 1,
+                "evidence_mean_iou": float(inter_s / union_s),
+                "evidence_mean_dice": float(dice_num_s / dice_den_s),
+            })
+
+    metrics = {
         "mean_iou": inter_sum / union_sum,
         "mean_dice": dice_n / dice_d
     }
+    return metrics, sample_records
 
 # ---------------------------
 # 热图可视化（原图+预测+GT）
@@ -245,8 +286,8 @@ def main():
     # ---------------------------
     # 4️⃣ 评估
     # ---------------------------
-    cls_metrics = eval_classification(heads, visual_tap, dl_test, device)
-    evi_metrics = eval_evidence(heads, visual_tap, dl_test, device)
+    cls_metrics, cls_records = eval_classification(heads, visual_tap, dl_test, device)
+    evi_metrics, evi_records = eval_evidence(heads, visual_tap, dl_test, device)
     print("[CLS]", cls_metrics)
     print("[EVI]", evi_metrics)
 
@@ -274,6 +315,21 @@ def main():
         writer.writerow(row)
 
     print(f"[LOG] 评估结果已写入: {csv_path}")
+
+    output_name = cfg.get("output_json", "inference_results.json")
+    merged_records = {}
+    for rec in cls_records:
+        merged_records[rec["image_path"]] = dict(rec)
+    for rec in evi_records:
+        entry = merged_records.setdefault(rec["image_path"], {"image_path": rec["image_path"]})
+        for key, value in rec.items():
+            if key == "image_path":
+                continue
+            entry[key] = value
+    inference_path = csv_path.with_name(output_name)
+    with inference_path.open("w", encoding="utf-8") as f:
+        json.dump(list(merged_records.values()), f, ensure_ascii=False, indent=2)
+    print(f"[LOG] 推理结果已写入: {inference_path}")
 
     # ---------------------------
     # 可选：可视化（当前注释掉）

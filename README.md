@@ -41,13 +41,13 @@
 ### Task 2 — LM-supervised LoRA without heads
 - 目录：`Qwen_code/task2_lm_lora/`
 - 作用：直接用语言模型输出对 ViT 进行 LoRA 训练与推理。
-- 数据预处理脚本：`map.py`，配置文件 `config_map.json`。
+- 数据预处理脚本：`Qwen_code/dataset_map.py`，配置文件 `Qwen_code/config_dataset_map.json`（三大任务共享）。
 - 训练脚本：`LORA.py`，配置文件 `config_lora_trainer.json`。
 - 评估脚本：`lora_infer.py`，配置文件 `config_lora_infer.json`。
 - 一键运行脚本：`python Qwen_code/task2_lm_lora/run_task2_experiment.py`
 
 运行流程：
-1. 预处理：`python Qwen_code/task2_lm_lora/map.py --config Qwen_code/task2_lm_lora/config_map.json`
+1. 预处理：`python Qwen_code/dataset_map.py --config Qwen_code/config_dataset_map.json`
 2. 训练：`python Qwen_code/task2_lm_lora/LORA.py --config Qwen_code/task2_lm_lora/config_lora_trainer.json`
 3. 评估：`python Qwen_code/task2_lm_lora/lora_infer.py --config Qwen_code/task2_lm_lora/config_lora_infer.json`
 

@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from datasets import load_from_disk
 from PIL import Image
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from tqdm import tqdm
@@ -29,8 +30,6 @@ class InferenceConfig:
     working_dir: str | None
     base_model_path: str
     lora_path: str
-    annotation_file: str
-    data_root: str
     csv_path: str
     prompt_text: str
     fake_token: str
@@ -40,6 +39,9 @@ class InferenceConfig:
     dataset_limit: int | None = None
     temperature: float | None = None
     top_p: float | None = None
+    output_json: str | None = None
+    mapped_dataset_path: str | None = None
+    dataset_name: str | None = None
 
     @staticmethod
     def from_dict(raw: dict) -> "InferenceConfig":
@@ -47,8 +49,6 @@ class InferenceConfig:
             working_dir=raw.get("working_dir"),
             base_model_path=raw["base_model_path"],
             lora_path=raw["lora_path"],
-            annotation_file=raw["annotation_file"],
-            data_root=raw.get("data_root", "."),
             csv_path=raw.get("csv_path", "./lora_infer_metrics.csv"),
             prompt_text=raw.get("prompt_text", "Is this image authentic? Answer:"),
             fake_token=raw.get("fake_token", " Fake"),
@@ -58,6 +58,9 @@ class InferenceConfig:
             dataset_limit=raw.get("dataset_limit"),
             temperature=raw.get("temperature"),
             top_p=raw.get("top_p"),
+            output_json=raw.get("output_json"),
+            mapped_dataset_path=raw.get("mapped_dataset_path"),
+            dataset_name=raw.get("dataset_name"),
         )
 
 
@@ -87,40 +90,44 @@ def prepare_environment(cfg: InferenceConfig) -> None:
     print("Current working directory:", os.getcwd())
 
 
-def resolve_path(path_str: str, root: Path) -> Path:
-    path = Path(path_str)
-    if not path.is_absolute():
-        path = root / path
-    return path.resolve()
-
-
 def load_dataset(cfg: InferenceConfig) -> list[dict]:
-    ann_path = Path(cfg.annotation_file).expanduser().resolve()
-    if not ann_path.exists():
-        raise FileNotFoundError(f"Annotation file not found: {ann_path}")
+    if not cfg.mapped_dataset_path:
+        raise ValueError(
+            "InferenceConfig.mapped_dataset_path must be provided to load the preprocessed dataset."
+        )
 
-    with ann_path.open("r", encoding="utf-8") as f:
-        records = json.load(f)
+    mapped_path = Path(cfg.mapped_dataset_path).expanduser().resolve()
+    if not mapped_path.exists():
+        raise FileNotFoundError(f"Mapped dataset not found: {mapped_path}")
 
-    data_root = Path(cfg.data_root).expanduser().resolve()
-    samples: list[dict] = []
-
-    for rec in records:
-        img_rel = rec.get("image_path")
-        if not img_rel:
-            continue
-        img_path = resolve_path(img_rel, data_root)
-        if not img_path.exists():
-            print(f"[WARN] Image not found, skipped: {img_path}")
-            continue
-        label = int(rec.get("label", 0))
-        samples.append({"image_path": img_path, "label": label})
-
+    dataset = load_from_disk(str(mapped_path))
     if cfg.dataset_limit is not None:
         limit = max(int(cfg.dataset_limit), 0)
-        samples = samples[:limit]
+        dataset = dataset.select(range(min(limit, len(dataset))))
 
-    print(f"Loaded {len(samples)} samples from {ann_path}")
+    samples: list[dict] = []
+    for rec in dataset:
+        image_path = rec.get("image_path")
+        if not image_path:
+            continue
+        sample: dict[str, object] = {
+            "image_path": Path(image_path),
+            "label": int(rec.get("label", 0)),
+        }
+        prompt = rec.get("prompt")
+        if prompt:
+            sample["prompt"] = prompt
+        dataset_name = rec.get("dataset_name")
+        if dataset_name:
+            sample["dataset_name"] = dataset_name
+
+        cached_keys = ("input_ids", "attention_mask", "pixel_values", "image_grid_thw")
+        if all(key in rec for key in cached_keys):
+            sample["preprocessed"] = {key: rec[key] for key in cached_keys}
+
+        samples.append(sample)
+
+    print(f"Loaded {len(samples)} samples from mapped dataset {mapped_path}")
     return samples
 
 
@@ -169,6 +176,21 @@ def prepare_inputs(image_path: Path, prompt: str, processor, device: str):
     return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
 
+def prepare_cached_inputs(cached_inputs: dict, device: str) -> dict:
+    prepared = {}
+    for key in ("input_ids", "attention_mask", "pixel_values", "image_grid_thw"):
+        if key not in cached_inputs:
+            continue
+        value = cached_inputs[key]
+        if not isinstance(value, torch.Tensor):
+            value = torch.as_tensor(value)
+        if value.dim() == 0:
+            value = value.unsqueeze(0)
+        value = value.unsqueeze(0)
+        prepared[key] = value.to(device)
+    return prepared
+
+
 def compute_probabilities(scores: torch.Tensor, fake_token_id: int, real_token_id: int) -> tuple[float, float]:
     probs = torch.softmax(scores, dim=-1)
     fake_prob = probs[fake_token_id].item()
@@ -191,8 +213,12 @@ def infer_sample(
     fake_token_id: int,
     real_token_id: int,
     generation_kwargs: dict,
+    cached_inputs: dict | None = None,
 ) -> tuple[float, str]:
-    inputs = prepare_inputs(image_path, prompt, processor, device)
+    if cached_inputs:
+        inputs = prepare_cached_inputs(cached_inputs, device)
+    else:
+        inputs = prepare_inputs(image_path, prompt, processor, device)
     gen_kwargs = {
         "max_new_tokens": generation_kwargs.get("max_new_tokens", 4),
         "do_sample": False,
@@ -226,7 +252,7 @@ def keywords_to_label(text: str) -> int | None:
     return None
 
 
-def evaluate(cfg: InferenceConfig) -> dict:
+def evaluate(cfg: InferenceConfig) -> tuple[dict, list[dict], str]:
     prepare_environment(cfg)
     dataset = load_dataset(cfg)
     if not dataset:
@@ -245,18 +271,28 @@ def evaluate(cfg: InferenceConfig) -> dict:
     y_true: list[int] = []
     y_prob: list[float] = []
     y_pred: list[int] = []
+    records: list[dict] = []
+    dataset_name = cfg.dataset_name
+    fallback_dataset_name = Path(cfg.mapped_dataset_path).name if cfg.mapped_dataset_path else "dataset"
 
     for sample in tqdm(dataset, desc="Evaluating"):
+        prompt = sample.get("prompt", cfg.prompt_text)
+        cached_inputs = sample.get("preprocessed") if isinstance(sample, dict) else None
+        sample_dataset_name = sample.get("dataset_name")
+        if dataset_name is None and sample_dataset_name:
+            dataset_name = sample_dataset_name
+        effective_dataset_name = dataset_name or sample_dataset_name or fallback_dataset_name
         prob_fake, text = infer_sample(
             model,
             processor,
             tokenizer,
             device,
             sample["image_path"],
-            cfg.prompt_text,
+            prompt,
             fake_token_id,
             real_token_id,
             generation_kwargs,
+            cached_inputs=cached_inputs,
         )
         label_true = int(sample["label"])
         label_pred = 1 if prob_fake >= 0.5 else 0
@@ -267,6 +303,17 @@ def evaluate(cfg: InferenceConfig) -> dict:
         y_prob.append(prob_fake)
         y_pred.append(label_pred)
 
+        records.append(
+            {
+                "image_path": str(sample["image_path"]),
+                "image_label": int(label_true),
+                "fake_probability": float(prob_fake),
+                "predicted_label": int(label_pred),
+                "generated_text": text,
+                "dataset_name": effective_dataset_name,
+            }
+        )
+
     metrics = {}
     try:
         metrics["auroc"] = float(roc_auc_score(y_true, y_prob))
@@ -276,16 +323,18 @@ def evaluate(cfg: InferenceConfig) -> dict:
     metrics["f1"] = float(f1_score(y_true, y_pred))
     metrics["samples"] = len(y_true)
     metrics["positive_ratio"] = float(np.mean(y_true))
-    return metrics
+    if dataset_name is None:
+        dataset_name = fallback_dataset_name
+    return metrics, records, dataset_name
 
 
-def append_metrics_to_csv(cfg: InferenceConfig, metrics: dict) -> Path:
+def append_metrics_to_csv(cfg: InferenceConfig, metrics: dict, dataset_name: str) -> Path:
     csv_path = Path(cfg.csv_path).expanduser().resolve()
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
     row = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "dataset": Path(cfg.annotation_file).resolve().parent.name,
+        "dataset": dataset_name,
         "samples": metrics.get("samples"),
         "positive_ratio": metrics.get("positive_ratio"),
         "auroc": metrics.get("auroc"),
@@ -307,10 +356,16 @@ def append_metrics_to_csv(cfg: InferenceConfig, metrics: dict) -> Path:
 def main():
     args = parse_args()
     cfg = load_config(args.config)
-    metrics = evaluate(cfg)
-    csv_path = append_metrics_to_csv(cfg, metrics)
+    metrics, records, dataset_name = evaluate(cfg)
+    csv_path = append_metrics_to_csv(cfg, metrics, dataset_name)
     print("Evaluation metrics:", metrics)
     print(f"Metrics appended to {csv_path}")
+
+    output_name = cfg.output_json or "inference_results.json"
+    inference_path = csv_path.with_name(output_name)
+    with inference_path.open("w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+    print(f"Inference results saved to {inference_path}")
 
 
 if __name__ == "__main__":
