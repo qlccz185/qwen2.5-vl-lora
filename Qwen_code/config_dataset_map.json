@@ -12,13 +12,13 @@
     {
       "name": "train",
       "annotation_file": "/root/autodl-tmp/data/trainingset2/annotation.json",
-      "batch_output_dir": "/root/autodl-tmp/qwen2.5-vl-lora/Qwen_code/datasets/train_batches",
+      "batch_output_dir": "/root/autodl-tmp/data/train_batches",
       "final_dataset_path": "/root/autodl-tmp/data/train_dataset_mapped"
     },
     {
       "name": "test",
       "annotation_file": "/root/autodl-tmp/data/testset2/annotation.json",
-      "batch_output_dir": "/root/autodl-tmp/qwen2.5-vl-lora/Qwen_code/datasets/test_batches",
+      "batch_output_dir": "/root/autodl-tmp/data/test_batches",
       "final_dataset_path": "/root/autodl-tmp/data/test_dataset_mapped"
     }
   ]
