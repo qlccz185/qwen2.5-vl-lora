@@ -9,9 +9,13 @@
   "batch_size": 8,
   "num_workers": 4,
   "lora_target_layers": [
-    7,15,23,31
+    7,
+    15,
+    23,
+    31
   ],
   "lora_r": 8,
   "lora_alpha": 16,
-  "lora_dropout": 0.05
+  "lora_dropout": 0.05,
+  "output_json": "/root/autodl-tmp/task1_modular_lora/subtask_vit_head_eval/inference_results.json"
 }

@@ -164,7 +164,7 @@ def first_token_id(tokenizer, text: str) -> int:
     return ids[0]
 
 
-def evaluate(cfg: Dict):
+def evaluate(cfg: Dict) -> tuple[Dict, list[dict]]:
     prepare_environment(cfg)
     model, processor, tokenizer, device = load_model(cfg)
     visual_tap, heads, fusion_projector = build_modules(model, cfg, device)
@@ -176,10 +176,11 @@ def evaluate(cfg: Dict):
 
     all_probs = []
     all_labels = []
+    records: list[dict] = []
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Eval", dynamic_ncols=True):
-            inputs, labels, masks = batch[0], batch[1], batch[2]
+            inputs, labels, masks, paths, _ = batch
             inputs = {k: v.to(device) for k, v in inputs.items()}
             labels = labels.to(device)
 
@@ -214,8 +215,20 @@ def evaluate(cfg: Dict):
             next_token_logits = logits[:, fusion_tokens + prompt_len - 1, :]
             probs = torch.softmax(next_token_logits[:, [fake_token, real_token]], dim=-1)
             fake_prob = probs[:, 0].detach().cpu()
+            labels_cpu = labels.detach().cpu()
             all_probs.append(fake_prob)
-            all_labels.append(labels.detach().cpu())
+            all_labels.append(labels_cpu)
+
+            prob_np = fake_prob.numpy()
+            label_np = labels_cpu.numpy().astype(int)
+            pred_np = (prob_np >= 0.5).astype(int)
+            for path, label_val, prob_val, pred_val in zip(paths, label_np, prob_np, pred_np):
+                records.append({
+                    "image_path": str(path),
+                    "image_label": int(label_val),
+                    "fake_probability": float(prob_val),
+                    "predicted_label": int(pred_val),
+                })
 
     y_prob = torch.cat(all_probs).numpy()
     y_true = torch.cat(all_labels).numpy().astype(int)
@@ -229,7 +242,10 @@ def evaluate(cfg: Dict):
 
     metrics = {"timestamp": datetime.utcnow().isoformat(), "auroc": auroc, "acc": acc, "f1": f1}
     print("Evaluation metrics:", metrics)
+    return metrics, records
 
+
+def append_metrics_to_csv(cfg: Dict, metrics: Dict) -> Path:
     csv_path = Path(cfg.get("csv_path", "task3_eval_metrics.csv"))
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     file_exists = csv_path.exists()
@@ -238,12 +254,20 @@ def evaluate(cfg: Dict):
         if not file_exists:
             writer.writeheader()
         writer.writerow(metrics)
+    return csv_path
 
 
 def main():
     args = parse_args()
     cfg = load_config(args.config)
-    evaluate(cfg)
+    metrics, records = evaluate(cfg)
+    csv_path = append_metrics_to_csv(cfg, metrics)
+    output_name = cfg.get("output_json", "inference_results.json")
+    inference_path = csv_path.with_name(output_name)
+    with inference_path.open("w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+    print(f"Metrics appended to {csv_path}")
+    print(f"Inference results saved to {inference_path}")
 
 
 if __name__ == "__main__":

@@ -2,10 +2,11 @@ import argparse
 import gc
 import json
 import os
+from collections.abc import Iterable
 from pathlib import Path
 
 import torch
-from datasets import Dataset, concatenate_datasets
+from datasets import Dataset, concatenate_datasets, load_from_disk
 from PIL import Image
 from tqdm import tqdm
 from transformers import AutoProcessor, AutoTokenizer
@@ -43,16 +44,49 @@ def build_tokenizer_and_processor(base_model_path: str):
     return tokenizer, processor
 
 
-def load_dataset_from_json(annotation_file: str, data_root: str, dataset_limit: int | None):
+def format_prompt(template: str, annotation: dict) -> tuple[str, str]:
+    label_value = annotation.get("label")
+    if label_value is None:
+        label_text = annotation.get("label_text", "")
+    else:
+        label_text = "Fake" if int(label_value) == 1 else "Real"
+
+    safe_context = {**annotation, "label_text": label_text}
+    try:
+        prompt = template.format(**safe_context)
+    except KeyError as exc:
+        missing_key = exc.args[0]
+        raise KeyError(
+            f"Prompt template references unknown field '{missing_key}'. "
+            "Please add it to the annotation or adjust the template."
+        ) from exc
+    return prompt, label_text
+
+
+def load_dataset_from_json(
+    annotation_file: str,
+    data_root: str,
+    dataset_limit: int | None,
+    prompt_template: str,
+) -> Dataset:
     with open(annotation_file, "r", encoding="utf-8") as f:
         annotations = json.load(f)
 
     data_list = []
     for ann in annotations:
-        img_path = str(Path(data_root) / ann["image_path"])
-        label_text = "Fake" if ann["label"] == 1 else "Real"
-        prompt_text = f"Please determine whether this image is Real or Fake. Answer only with Fake or Real. Answer: {label_text}"
-        data_list.append({"image_path": img_path, "prompt": prompt_text, "label_text": label_text})
+        image_rel = ann.get("image_path")
+        if not image_rel:
+            continue
+        img_path = str(Path(data_root) / image_rel)
+        prompt_text, label_text = format_prompt(prompt_template, ann)
+        record = {
+            "image_path": img_path,
+            "prompt": prompt_text,
+            "label_text": label_text,
+        }
+        if "label" in ann:
+            record["label"] = int(ann["label"])
+        data_list.append(record)
 
     dataset = Dataset.from_list(data_list)
     if dataset_limit is not None:
@@ -61,11 +95,22 @@ def load_dataset_from_json(annotation_file: str, data_root: str, dataset_limit: 
 
 
 def process_func_safe(examples):
-    results = {"input_ids": [], "attention_mask": [], "labels": [], "pixel_values": [], "image_grid_thw": []}
+    results = {
+        "input_ids": [],
+        "attention_mask": [],
+        "labels": [],
+        "pixel_values": [],
+        "image_grid_thw": [],
+        "image_path": [],
+        "prompt": [],
+    }
+    if "label" in examples:
+        results["label"] = []
     for i in range(len(examples["image_path"])):
         try:
             img_path = examples["image_path"][i]
             prompt = examples["prompt"][i]
+            label_value = examples.get("label", [None] * len(examples["image_path"]))[i]
 
             with Image.open(img_path).convert("RGB") as img:
                 width, height = img.size
@@ -93,11 +138,77 @@ def process_func_safe(examples):
             results["labels"].append(labels)
             results["pixel_values"].append(inputs["pixel_values"])
             results["image_grid_thw"].append(inputs["image_grid_thw"])
+            results["image_path"].append(img_path)
+            results["prompt"].append(prompt)
+            if "label" in results:
+                results["label"].append(None if label_value is None else int(label_value))
 
         except Exception as e:
             print(f"Skipped {examples['image_path'][i]} due to error: {e}")
             continue
     return results
+
+
+def ensure_iterable(obj) -> Iterable:
+    if isinstance(obj, Iterable) and not isinstance(obj, (str, bytes, dict)):
+        return obj
+    return [obj]
+
+
+def map_and_merge_dataset(dataset: Dataset, dataset_cfg: dict, global_cfg: dict):
+    name = dataset_cfg.get("name", "dataset")
+    map_batch_size = dataset_cfg.get("map_batch_size", global_cfg.get("map_batch_size", 50))
+    batch_output_dir = Path(
+        dataset_cfg.get(
+            "batch_output_dir",
+            Path(global_cfg.get("batch_output_dir", "data/map_batches")) / name,
+        )
+    )
+    batch_output_dir.mkdir(parents=True, exist_ok=True)
+
+    map_kwargs = dict(global_cfg.get("map_kwargs", {}))
+    map_kwargs.update(dataset_cfg.get("map_kwargs", {}))
+    map_batch_size_inner = map_kwargs.get("batch_size", 1)
+    map_num_proc = map_kwargs.get("num_proc", 1)
+
+    num_batches = (len(dataset) + map_batch_size - 1) // map_batch_size
+    for batch_idx, start_idx in enumerate(
+        tqdm(range(0, len(dataset), map_batch_size), total=num_batches, desc=f"Mapping {name} dataset")
+    ):
+        end_idx = min(start_idx + map_batch_size, len(dataset))
+        batch_dataset = dataset.select(range(start_idx, end_idx))
+
+        processed_batch = batch_dataset.map(
+            process_func_safe,
+            batched=True,
+            batch_size=map_batch_size_inner,
+            num_proc=map_num_proc,
+            remove_columns=[],
+        )
+
+        processed_batch.save_to_disk(batch_output_dir / f"{name}_batch_{batch_idx}")
+
+        del batch_dataset, processed_batch
+        gc.collect()
+
+    all_batches = []
+    for batch_idx in range(num_batches):
+        batch_ds = load_from_disk(batch_output_dir / f"{name}_batch_{batch_idx}")
+        all_batches.append(batch_ds)
+
+    if not all_batches:
+        raise RuntimeError(f"No batches were created for dataset '{name}'.")
+
+    final_dataset = concatenate_datasets(all_batches)
+    final_output_path = Path(
+        dataset_cfg.get(
+            "final_dataset_path",
+            Path(global_cfg.get("final_dataset_path", "data/mapped_datasets")) / f"{name}_dataset_mapped",
+        )
+    )
+    final_output_path.parent.mkdir(parents=True, exist_ok=True)
+    final_dataset.save_to_disk(str(final_output_path))
+    print(f"All batches for {name} merged and saved to {final_output_path}")
 
 def main():
     args = parse_args()
@@ -107,52 +218,40 @@ def main():
     global tokenizer, processor
     tokenizer, processor = build_tokenizer_and_processor(cfg["base_model_path"])
 
-    full_train_dataset = load_dataset_from_json(
-        cfg["annotation_file"],
-        cfg["data_root"],
-        cfg.get("dataset_limit"),
+    prompt_template = cfg.get(
+        "prompt_template",
+        "Please determine whether this image is Real or Fake. Answer only with Fake or Real. Answer: {label_text}",
     )
 
-    batch_size = cfg.get("map_batch_size", 50)
-    batch_output_dir = Path(cfg.get("batch_output_dir", "data/train_map"))
-    batch_output_dir.mkdir(parents=True, exist_ok=True)
+    datasets_cfg = cfg.get("datasets")
+    if not datasets_cfg:
+        datasets_cfg = [
+            {
+                "name": cfg.get("dataset_name", "train"),
+                "annotation_file": cfg["annotation_file"],
+                "data_root": cfg.get("data_root", "."),
+                "dataset_limit": cfg.get("dataset_limit"),
+                "map_batch_size": cfg.get("map_batch_size"),
+                "batch_output_dir": cfg.get("batch_output_dir"),
+                "final_dataset_path": cfg.get("final_dataset_path"),
+            }
+        ]
 
-    num_batches = (len(full_train_dataset) + batch_size - 1) // batch_size
-    map_kwargs = cfg.get("map_kwargs", {})
-    map_batch_size = map_kwargs.get("batch_size", 1)
-    map_num_proc = map_kwargs.get("num_proc", 1)
-
-    for batch_idx, start_idx in enumerate(
-        tqdm(range(0, len(full_train_dataset), batch_size), total=num_batches, desc="Mapping train dataset")
-    ):
-        end_idx = min(start_idx + batch_size, len(full_train_dataset))
-        batch_dataset = full_train_dataset.select(range(start_idx, end_idx))
-
-        processed_batch = batch_dataset.map(
-            process_func_safe,
-            batched=True,
-            batch_size=map_batch_size,
-            num_proc=map_num_proc,
-            remove_columns=batch_dataset.column_names,
+    for dataset_cfg in ensure_iterable(datasets_cfg):
+        dataset_prompt = dataset_cfg.get("prompt_template", prompt_template)
+        dataset_limit = dataset_cfg.get("dataset_limit", cfg.get("dataset_limit"))
+        dataset = load_dataset_from_json(
+            dataset_cfg["annotation_file"],
+            dataset_cfg.get("data_root", cfg.get("data_root", ".")),
+            dataset_limit,
+            dataset_prompt,
         )
 
-        processed_batch.save_to_disk(batch_output_dir / f"train_batch_{batch_idx}")
+        if len(dataset) == 0:
+            print(f"[WARN] Dataset '{dataset_cfg.get('name', 'dataset')}' is empty. Skipping.")
+            continue
 
-        del batch_dataset, processed_batch
-        gc.collect()
-
-    from datasets import load_from_disk
-
-    all_batches = []
-    for batch_idx in range(num_batches):
-        batch_ds = load_from_disk(batch_output_dir / f"train_batch_{batch_idx}")
-        all_batches.append(batch_ds)
-
-    final_train_dataset = concatenate_datasets(all_batches)
-    final_output_path = Path(cfg.get("final_dataset_path", "data/train_dataset_mapped"))
-    final_output_path.parent.mkdir(parents=True, exist_ok=True)
-    final_train_dataset.save_to_disk(str(final_output_path))
-    print(f"All batches merged and saved to {final_output_path}")
+        map_and_merge_dataset(dataset, dataset_cfg, cfg)
 
 
 if __name__ == "__main__":

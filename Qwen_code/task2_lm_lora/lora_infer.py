@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from datasets import load_from_disk
 from PIL import Image
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from tqdm import tqdm
@@ -40,6 +41,8 @@ class InferenceConfig:
     dataset_limit: int | None = None
     temperature: float | None = None
     top_p: float | None = None
+    output_json: str | None = None
+    mapped_dataset_path: str | None = None
 
     @staticmethod
     def from_dict(raw: dict) -> "InferenceConfig":
@@ -58,6 +61,8 @@ class InferenceConfig:
             dataset_limit=raw.get("dataset_limit"),
             temperature=raw.get("temperature"),
             top_p=raw.get("top_p"),
+            output_json=raw.get("output_json"),
+            mapped_dataset_path=raw.get("mapped_dataset_path"),
         )
 
 
@@ -95,6 +100,38 @@ def resolve_path(path_str: str, root: Path) -> Path:
 
 
 def load_dataset(cfg: InferenceConfig) -> list[dict]:
+    if cfg.mapped_dataset_path:
+        mapped_path = Path(cfg.mapped_dataset_path).expanduser().resolve()
+        if not mapped_path.exists():
+            raise FileNotFoundError(f"Mapped dataset not found: {mapped_path}")
+
+        dataset = load_from_disk(str(mapped_path))
+        if cfg.dataset_limit is not None:
+            limit = max(int(cfg.dataset_limit), 0)
+            dataset = dataset.select(range(min(limit, len(dataset))))
+
+        samples: list[dict] = []
+        for rec in dataset:
+            image_path = rec.get("image_path")
+            if not image_path:
+                continue
+            sample: dict[str, object] = {
+                "image_path": Path(image_path),
+                "label": int(rec.get("label", 0)),
+            }
+            prompt = rec.get("prompt")
+            if prompt:
+                sample["prompt"] = prompt
+
+            cached_keys = ("input_ids", "attention_mask", "pixel_values", "image_grid_thw")
+            if all(key in rec for key in cached_keys):
+                sample["preprocessed"] = {key: rec[key] for key in cached_keys}
+
+            samples.append(sample)
+
+        print(f"Loaded {len(samples)} samples from mapped dataset {mapped_path}")
+        return samples
+
     ann_path = Path(cfg.annotation_file).expanduser().resolve()
     if not ann_path.exists():
         raise FileNotFoundError(f"Annotation file not found: {ann_path}")
@@ -114,7 +151,7 @@ def load_dataset(cfg: InferenceConfig) -> list[dict]:
             print(f"[WARN] Image not found, skipped: {img_path}")
             continue
         label = int(rec.get("label", 0))
-        samples.append({"image_path": img_path, "label": label})
+        samples.append({"image_path": img_path, "label": label, "prompt": cfg.prompt_text})
 
     if cfg.dataset_limit is not None:
         limit = max(int(cfg.dataset_limit), 0)
@@ -169,6 +206,21 @@ def prepare_inputs(image_path: Path, prompt: str, processor, device: str):
     return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
 
+def prepare_cached_inputs(cached_inputs: dict, device: str) -> dict:
+    prepared = {}
+    for key in ("input_ids", "attention_mask", "pixel_values", "image_grid_thw"):
+        if key not in cached_inputs:
+            continue
+        value = cached_inputs[key]
+        if not isinstance(value, torch.Tensor):
+            value = torch.as_tensor(value)
+        if value.dim() == 0:
+            value = value.unsqueeze(0)
+        value = value.unsqueeze(0)
+        prepared[key] = value.to(device)
+    return prepared
+
+
 def compute_probabilities(scores: torch.Tensor, fake_token_id: int, real_token_id: int) -> tuple[float, float]:
     probs = torch.softmax(scores, dim=-1)
     fake_prob = probs[fake_token_id].item()
@@ -191,8 +243,12 @@ def infer_sample(
     fake_token_id: int,
     real_token_id: int,
     generation_kwargs: dict,
+    cached_inputs: dict | None = None,
 ) -> tuple[float, str]:
-    inputs = prepare_inputs(image_path, prompt, processor, device)
+    if cached_inputs:
+        inputs = prepare_cached_inputs(cached_inputs, device)
+    else:
+        inputs = prepare_inputs(image_path, prompt, processor, device)
     gen_kwargs = {
         "max_new_tokens": generation_kwargs.get("max_new_tokens", 4),
         "do_sample": False,
@@ -226,7 +282,7 @@ def keywords_to_label(text: str) -> int | None:
     return None
 
 
-def evaluate(cfg: InferenceConfig) -> dict:
+def evaluate(cfg: InferenceConfig) -> tuple[dict, list[dict]]:
     prepare_environment(cfg)
     dataset = load_dataset(cfg)
     if not dataset:
@@ -245,18 +301,22 @@ def evaluate(cfg: InferenceConfig) -> dict:
     y_true: list[int] = []
     y_prob: list[float] = []
     y_pred: list[int] = []
+    records: list[dict] = []
 
     for sample in tqdm(dataset, desc="Evaluating"):
+        prompt = sample.get("prompt", cfg.prompt_text)
+        cached_inputs = sample.get("preprocessed") if isinstance(sample, dict) else None
         prob_fake, text = infer_sample(
             model,
             processor,
             tokenizer,
             device,
             sample["image_path"],
-            cfg.prompt_text,
+            prompt,
             fake_token_id,
             real_token_id,
             generation_kwargs,
+            cached_inputs=cached_inputs,
         )
         label_true = int(sample["label"])
         label_pred = 1 if prob_fake >= 0.5 else 0
@@ -267,6 +327,16 @@ def evaluate(cfg: InferenceConfig) -> dict:
         y_prob.append(prob_fake)
         y_pred.append(label_pred)
 
+        records.append(
+            {
+                "image_path": str(sample["image_path"]),
+                "image_label": int(label_true),
+                "fake_probability": float(prob_fake),
+                "predicted_label": int(label_pred),
+                "generated_text": text,
+            }
+        )
+
     metrics = {}
     try:
         metrics["auroc"] = float(roc_auc_score(y_true, y_prob))
@@ -276,7 +346,7 @@ def evaluate(cfg: InferenceConfig) -> dict:
     metrics["f1"] = float(f1_score(y_true, y_pred))
     metrics["samples"] = len(y_true)
     metrics["positive_ratio"] = float(np.mean(y_true))
-    return metrics
+    return metrics, records
 
 
 def append_metrics_to_csv(cfg: InferenceConfig, metrics: dict) -> Path:
@@ -307,10 +377,16 @@ def append_metrics_to_csv(cfg: InferenceConfig, metrics: dict) -> Path:
 def main():
     args = parse_args()
     cfg = load_config(args.config)
-    metrics = evaluate(cfg)
+    metrics, records = evaluate(cfg)
     csv_path = append_metrics_to_csv(cfg, metrics)
     print("Evaluation metrics:", metrics)
     print(f"Metrics appended to {csv_path}")
+
+    output_name = cfg.output_json or "inference_results.json"
+    inference_path = csv_path.with_name(output_name)
+    with inference_path.open("w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+    print(f"Inference results saved to {inference_path}")
 
 
 if __name__ == "__main__":
