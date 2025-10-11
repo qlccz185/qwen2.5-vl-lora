@@ -255,18 +255,19 @@ def compute_head_losses(
     }
 
 
+
 def build_fusion_features(
     heads: ForensicJoint,
     fused_feature: torch.Tensor,
     cls_logits: torch.Tensor,
     hm_logits: torch.Tensor,
 ) -> torch.Tensor:
-    cls_prob = torch.sigmoid(cls_logits).unsqueeze(1)
+    cls_prob = torch.sigmoid(cls_logits).unsqueeze(1)  # [B, 1]
     if hm_logits.dim() == 3:
         hm_logits = hm_logits.unsqueeze(1)
     hm_prob = torch.sigmoid(hm_logits)
-    hm_mean = hm_prob.mean(dim=(1, 2, 3), keepdim=True)
-    hm_max = hm_prob.amax(dim=(1, 2, 3), keepdim=True)
+    hm_mean = hm_prob.mean(dim=(1, 2, 3), keepdim=False).unsqueeze(1)  # [B, 1]
+    hm_max = hm_prob.amax(dim=(1, 2, 3), keepdim=False).unsqueeze(1)   # [B, 1]
     pooled = heads.cls.pool(fused_feature)  # [B, C]
     return torch.cat([cls_prob, cls_logits.unsqueeze(1), hm_mean, hm_max, pooled], dim=1)
 

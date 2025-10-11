@@ -1,7 +1,7 @@
 {
   "model_path": "/root/autodl-tmp/Qwen2.5-VL-7B-Instruct",
   "data_root": "/root/autodl-tmp/data",
-  "ann_file": "/root/autodl-tmp/data/testset2/test_idx.json",
+  "ann_file": "/root/autodl-tmp/data/testset2/annotation.json",
   "out_dir": "/root/autodl-tmp/task2_lm_lora/eval",
   "lora_weights": "/root/autodl-tmp/task2_lm_lora/training/lm_supervised/best",
   "working_dir": "/root/autodl-tmp/qwen2.5-vl-lora/Qwen_code",

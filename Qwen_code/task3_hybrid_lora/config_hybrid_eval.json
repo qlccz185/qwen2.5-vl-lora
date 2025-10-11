@@ -19,7 +19,7 @@
     31
   ],
   "fusion_tokens": 4,
-  "prompt": "请判断这张图像是真实(Real)还是伪造(Fake)，只回答 Fake 或 Real。",
+  "prompt": "Please determine whether this image is Real or Fake. Answer only with Fake or Real.",
   "fake_token": " Fake",
   "real_token": " Real",
   "output_json": "/root/autodl-tmp/task3_hybrid_lora/evaluation/inference_results.json",

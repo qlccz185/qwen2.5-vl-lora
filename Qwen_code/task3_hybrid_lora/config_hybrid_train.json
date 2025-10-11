@@ -51,7 +51,16 @@
     },
     "lm": {
       "enabled": true,
-      "module_patterns": ["model.layers", "lm_head"]
+      "extra_modules": [
+        "language_model.layers.24.self_attn.q_proj",
+        "language_model.layers.24.self_attn.v_proj",
+        "language_model.layers.25.self_attn.q_proj",
+        "language_model.layers.25.self_attn.v_proj",
+        "language_model.layers.26.self_attn.q_proj",
+        "language_model.layers.26.self_attn.v_proj",
+        "language_model.layers.27.self_attn.q_proj",
+        "language_model.layers.27.self_attn.v_proj"
+      ]
     }
   },
 
