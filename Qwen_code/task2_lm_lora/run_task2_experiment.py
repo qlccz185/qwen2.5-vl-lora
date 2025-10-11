@@ -1,72 +1,43 @@
-#!/usr/bin/env python3
-"""Run Task2 (LM-guided LoRA) full pipeline."""
-
+"""One-click pipeline for Task2 LM-supervised LoRA training + evaluation."""
 from __future__ import annotations
 
 import argparse
-import subprocess
-import sys
 from pathlib import Path
+
+from train import load_config as load_train_config, train
+from evaluate import load_config as load_eval_config, evaluate
 
 
 def parse_args() -> argparse.Namespace:
-    base_dir = Path(__file__).resolve().parent
-    repo_root = base_dir.parent
-    parser = argparse.ArgumentParser(description="Run Task2 dataset mapping, training, and inference")
-    parser.add_argument(
-        "--map-config",
-        type=Path,
-        default=repo_root / "config_dataset_map.json",
-        help="Configuration for the shared dataset preprocessing step",
-    )
+    parser = argparse.ArgumentParser(description="Run Task2 training and evaluation end-to-end")
     parser.add_argument(
         "--train-config",
         type=Path,
-        default=base_dir / "config_lora_trainer.json",
-        help="Configuration for LoRA training",
+        default=Path(__file__).with_name("config_train.json"),
+        help="Path to the training configuration JSON",
     )
     parser.add_argument(
-        "--infer-config",
+        "--eval-config",
         type=Path,
-        default=base_dir / "config_lora_infer.json",
-        help="Configuration for evaluation/inference",
+        default=Path(__file__).with_name("config_eval.json"),
+        help="Path to the evaluation configuration JSON",
     )
     parser.add_argument(
-        "--python",
-        type=str,
-        default=sys.executable,
-        help="Python interpreter for subprocess calls",
+        "--skip-eval",
+        action="store_true",
+        help="Only run training without launching evaluation",
     )
     return parser.parse_args()
 
 
-def run_step(description: str, command: list[str]) -> None:
-    print(f"\n[RUN] {description}")
-    print("Command:", " ".join(command))
-    subprocess.run(command, check=True)
-
-
 def main() -> None:
     args = parse_args()
-    base_dir = Path(__file__).resolve().parent
-    repo_root = base_dir.parent
+    train_cfg = load_train_config(args.train_config)
+    train(train_cfg)
 
-    run_step(
-        "Mapping datasets for Task2",
-        [args.python, str(repo_root / "dataset_map.py"), "--config", str(args.map_config.resolve())],
-    )
-
-    run_step(
-        "Training Task2 LoRA adapters",
-        [args.python, str(base_dir / "LORA.py"), "--config", str(args.train_config.resolve())],
-    )
-
-    run_step(
-        "Evaluating Task2 adapters via language model outputs",
-        [args.python, str(base_dir / "lora_infer.py"), "--config", str(args.infer_config.resolve())],
-    )
-
-    print("\n[SUCCESS] Task2 experiment completed.")
+    if not args.skip_eval:
+        eval_cfg = load_eval_config(args.eval_config)
+        evaluate(eval_cfg)
 
 
 if __name__ == "__main__":
