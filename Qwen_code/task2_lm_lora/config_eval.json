@@ -1,0 +1,14 @@
+{
+  "base_model_path": "/root/autodl-tmp/Qwen2.5-VL-7B-Instruct",
+  "annotation_file": "/root/autodl-tmp/data/trainingset2/val_idx.json",
+  "data_root": "/root/autodl-tmp/data",
+  "prompt": "You are a forensic assistant. Determine whether the image is fake. Answer 'yes' if the image is fake, otherwise answer 'no'.",
+  "output_dir": "/root/autodl-tmp/task2_lm_lora/evaluation/lm_supervised",
+  "lora_weights": "/root/autodl-tmp/task2_lm_lora/training/lm_supervised/best",
+  "image_size": 448,
+  "batch_size": 4,
+  "torch_dtype": "bfloat16",
+  "positive_response": " yes",
+  "negative_response": " no",
+  "dump_predictions": "predictions.csv"
+}
