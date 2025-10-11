@@ -1,0 +1,18 @@
+{
+  "model_path": "/root/autodl-tmp/Qwen2.5-VL-7B-Instruct",
+  "data_root": "/root/autodl-tmp/data",
+  "ann_file": "/root/autodl-tmp/data/testset2/test_idx.json",
+  "out_dir": "/root/autodl-tmp/task2_lm_lora/eval",
+  "lora_weights": "/root/autodl-tmp/task2_lm_lora/training/lm_supervised/best",
+  "working_dir": "/root/autodl-tmp/qwen2.5-vl-lora/Qwen_code",
+
+  "batch_size": 2,
+  "num_workers": 4,
+  "amp_dtype": "bf16",
+  "image_size": 448,
+
+  "prompt_text": "Please determine whether this image is Real or Fake. Answer only with Fake or Real.",
+  "positive_response": " Fake",
+  "negative_response": " Real",
+  "dump_predictions": "predictions.csv"
+}
