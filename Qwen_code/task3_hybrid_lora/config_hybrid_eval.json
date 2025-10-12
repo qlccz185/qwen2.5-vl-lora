@@ -19,9 +19,11 @@
     31
   ],
   "fusion_tokens": 4,
+  "fusion_hidden_dropout": 0.1,
   "prompt": "Please determine whether this image is Real or Fake. Answer only with Fake or Real.",
-  "fake_token": " Fake",
-  "real_token": " Real",
-  "output_json": "/root/autodl-tmp/task3_hybrid_lora/evaluation/inference_results.json",
-  "mapped_dataset_path": "/root/autodl-tmp/qwen2.5-vl-lora/Qwen_code/datasets/test_dataset_mapped"
+  "target_text": {
+    "fake": "Fake",
+    "real": "Real"
+  },
+  "output_json": "/root/autodl-tmp/task3_hybrid_lora/evaluation/inference_results.json"
 }

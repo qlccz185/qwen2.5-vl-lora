@@ -5,16 +5,14 @@ import argparse
 import csv
 import json
 import os
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Sequence
+from typing import Dict, Optional, Sequence
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from datasets import load_from_disk
-from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from peft import PeftModel
@@ -47,170 +45,128 @@ class FusionProjector(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B = x.size(0)
         fused = self.net(x)
-        return fused.view(B, self.token_count, self.hidden_size)
+        batch = x.size(0)
+        return fused.view(batch, self.token_count, self.hidden_size)
 
 
-def parse_args():
+@dataclass
+class HybridEvalConfig:
+    base_model_path: str
+    data_root: str
+    annotation_file: str
+    csv_path: str = "task3_eval_metrics.csv"
+    output_json: str = "inference_results.json"
+    lora_checkpoint: Optional[str] = None
+    head_checkpoint: Optional[str] = None
+    fusion_checkpoint: Optional[str] = None
+    working_dir: Optional[str] = None
+    seed: Optional[int] = None
+
+    batch_size: int = 2
+    num_workers: int = 2
+    image_size: int = 448
+    torch_dtype: str = "bfloat16"
+    fusion_tokens: int = 4
+    fusion_hidden_dropout: float = 0.1
+    visual_layers: Sequence[int] = (7, 15, 23, 31)
+    prompt: str = (
+        "Please determine whether this image is Real or Fake. Answer only with Fake or Real."
+    )
+    target_text: Dict[str, str] = field(
+        default_factory=lambda: {"fake": "Fake", "real": "Real"}
+    )
+    fake_token: Optional[str] = None
+    real_token: Optional[str] = None
+    mapped_dataset_path: Optional[str] = None  # deprecated, kept for compatibility
+
+
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Task3 hybrid evaluation")
     default_cfg = Path(__file__).with_name("config_hybrid_eval.json")
     parser.add_argument("--config", type=Path, default=default_cfg, help="Path to config JSON")
     return parser.parse_args()
 
 
-def load_config(path: Path) -> Dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+def load_config(path: Path) -> HybridEvalConfig:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return HybridEvalConfig(**data)
 
 
-def prepare_environment(cfg: Dict):
-    work = cfg.get("working_dir")
-    if work:
-        os.chdir(work)
+def prepare_environment(cfg: HybridEvalConfig) -> None:
+    if cfg.working_dir:
+        work_dir = Path(cfg.working_dir).expanduser().resolve()
+        work_dir.mkdir(parents=True, exist_ok=True)
+        os.chdir(work_dir)
     print("Current working directory:", os.getcwd())
-    seed = cfg.get("seed")
-    if seed is not None:
-        set_seed(seed)
+    if cfg.seed is not None:
+        set_seed(cfg.seed)
 
 
-def load_model(cfg: Dict):
-    dtype_name = cfg.get("torch_dtype")
-    torch_dtype = getattr(torch, dtype_name) if dtype_name else torch.bfloat16
-    base_model_path = cfg["base_model_path"]
-
-    print("Loading base model from", base_model_path)
+def load_model(cfg: HybridEvalConfig):
+    dtype = getattr(torch, cfg.torch_dtype) if cfg.torch_dtype else torch.bfloat16
+    print("Loading base model from", cfg.base_model_path)
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        base_model_path,
-        torch_dtype=torch_dtype,
+        cfg.base_model_path,
+        torch_dtype=dtype,
     )
 
-    lora_ckpt = cfg.get("lora_checkpoint")
-    if lora_ckpt:
-        print("Loading LoRA adapters from", lora_ckpt)
-        model = PeftModel.from_pretrained(model, lora_ckpt)
-        model = model.merge_and_unload()
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if cfg.lora_checkpoint:
+        print("Loading LoRA adapters from", cfg.lora_checkpoint)
+        model = PeftModel.from_pretrained(model, cfg.lora_checkpoint)
+
     model.to(device)
     model.eval()
 
-    processor = AutoProcessor.from_pretrained(base_model_path)
-    tokenizer = AutoTokenizer.from_pretrained(base_model_path)
+    processor = AutoProcessor.from_pretrained(cfg.base_model_path)
+    tokenizer = AutoTokenizer.from_pretrained(cfg.base_model_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    return model, processor, tokenizer, device
+    base_model = model.get_base_model() if hasattr(model, "get_base_model") else model
+
+    return model, base_model, processor, tokenizer, device
 
 
-def build_modules(model, cfg: Dict, device):
-    visual_layers = tuple(cfg.get("visual_layers", [7, 15, 23, 31]))
-    visual_tap = QwenVisualTap(model.visual, layers=visual_layers).to(device)
+def build_modules(base_model, full_model, cfg: HybridEvalConfig, device):
+    visual_layers = tuple(int(v) for v in cfg.visual_layers)
+    visual_tap = QwenVisualTap(base_model.visual, layers=visual_layers).to(device)
     heads = ForensicJoint(layers=visual_layers).to(device)
     fusion_dim = heads.cls.fc1.in_features + 4
-    fusion_tokens = int(cfg.get("fusion_tokens", 4))
     fusion_projector = FusionProjector(
         input_dim=fusion_dim,
-        hidden_size=model.config.hidden_size,
-        token_count=fusion_tokens,
-        dropout=cfg.get("fusion_hidden_dropout", 0.1),
+        hidden_size=full_model.config.hidden_size,
+        token_count=int(cfg.fusion_tokens),
+        dropout=cfg.fusion_hidden_dropout,
     ).to(device)
 
-    head_ckpt = cfg.get("head_checkpoint")
-    if head_ckpt:
-        print("Loading head checkpoint from", head_ckpt)
-        heads.load_state_dict(torch.load(head_ckpt, map_location=device))
+    if cfg.head_checkpoint:
+        print("Loading head checkpoint from", cfg.head_checkpoint)
+        heads.load_state_dict(torch.load(cfg.head_checkpoint, map_location=device))
     heads.eval()
 
-    fusion_ckpt = cfg.get("fusion_checkpoint")
-    if fusion_ckpt:
-        print("Loading fusion projector from", fusion_ckpt)
-        fusion_projector.load_state_dict(torch.load(fusion_ckpt, map_location=device))
+    if cfg.fusion_checkpoint:
+        print("Loading fusion projector from", cfg.fusion_checkpoint)
+        fusion_projector.load_state_dict(torch.load(cfg.fusion_checkpoint, map_location=device))
     fusion_projector.eval()
 
     return visual_tap, heads, fusion_projector
 
 
-def _parse_size_str(value: str | None):
-    if not value or not isinstance(value, str):
-        return None
-    lower = value.lower()
-    if "x" not in lower:
-        return None
-    try:
-        h_str, w_str = lower.split("x")
-        return int(h_str), int(w_str)
-    except (TypeError, ValueError):
-        return None
-
-
-class MappedForgeryDataset(Dataset):
-    def __init__(self, hf_dataset, default_root: str | None = None):
-        self.dataset = hf_dataset
-        self.default_root = Path(default_root).resolve() if default_root else None
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, index: int):
-        rec = self.dataset[index]
-        image_path = Path(rec.get("image_path", rec.get("path", ""))).expanduser().resolve()
-        image = Image.open(image_path).convert("RGB")
-
-        label = int(rec.get("label", rec.get("image_label", 0)))
-        mask = None
-
-        mask_ref = rec.get("mask_ref") or rec.get("mask_path")
-        mask_resolved = rec.get("mask_path_resolved")
-
-        if label == 1:
-            candidate = None
-            if mask_resolved:
-                candidate = Path(mask_resolved)
-            elif mask_ref and not _parse_size_str(mask_ref):
-                candidate = Path(mask_ref)
-                if not candidate.is_absolute() and self.default_root:
-                    candidate = self.default_root / candidate
-            if candidate and candidate.exists():
-                mask = Image.open(candidate).convert("L")
-        else:
-            mask_size = rec.get("mask_size")
-            if isinstance(mask_size, (list, tuple)) and len(mask_size) == 2:
-                height, width = int(mask_size[0]), int(mask_size[1])
-            else:
-                size = _parse_size_str(mask_ref)
-                if size is None:
-                    width, height = image.size
-                    size = (height, width)
-                height, width = int(size[0]), int(size[1])
-            mask = Image.new("L", (width, height), 0)
-
-        return {"image": image, "label": label, "mask": mask, "path": str(image_path)}
-
-
-def build_dataloader(processor, cfg: Dict) -> DataLoader:
-    mapped_path = cfg.get("mapped_dataset_path")
-    batch_size = cfg.get("batch_size", 2)
-    num_workers = cfg.get("num_workers", 2)
-    image_size = cfg.get("image_size", 448)
-
-    if mapped_path:
-        hf_dataset = load_from_disk(mapped_path)
-        dataset_limit = cfg.get("dataset_limit")
-        if dataset_limit is not None:
-            hf_dataset = hf_dataset.select(range(min(int(dataset_limit), len(hf_dataset))))
-        dataset = MappedForgeryDataset(hf_dataset, default_root=cfg.get("data_root"))
-    else:
-        dataset = ForgeryJointValDataset(cfg["annotation_file"], data_root=cfg.get("data_root"))
-
+def build_dataloader(processor, cfg: HybridEvalConfig) -> DataLoader:
+    ann_path = cfg.annotation_file or cfg.mapped_dataset_path
+    if not ann_path:
+        raise ValueError("Annotation file path must be provided in the evaluation config.")
+    dataset = ForgeryJointValDataset(ann_path, data_root=cfg.data_root)
     return DataLoader(
         dataset,
-        batch_size=batch_size,
+        batch_size=cfg.batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=cfg.num_workers,
         pin_memory=True,
-        collate_fn=lambda batch: collate_joint_test(batch, processor, image_size),
+        collate_fn=lambda batch: collate_joint_test(batch, processor, cfg.image_size),
     )
 
 
@@ -232,15 +188,18 @@ def first_token_id(tokenizer, text: str) -> int:
     return ids[0]
 
 
-def evaluate(cfg: Dict) -> tuple[Dict, list[dict]]:
+def evaluate(cfg: HybridEvalConfig) -> tuple[dict, list[dict]]:
     prepare_environment(cfg)
-    model, processor, tokenizer, device = load_model(cfg)
-    visual_tap, heads, fusion_projector = build_modules(model, cfg, device)
+    full_model, base_model, processor, tokenizer, device = load_model(cfg)
+    visual_tap, heads, fusion_projector = build_modules(base_model, full_model, cfg, device)
     dataloader = build_dataloader(processor, cfg)
 
-    fusion_tokens = int(cfg.get("fusion_tokens", 4))
-    fake_token = first_token_id(tokenizer, cfg.get("fake_token", " Fake"))
-    real_token = first_token_id(tokenizer, cfg.get("real_token", " Real"))
+    fusion_tokens = int(cfg.fusion_tokens)
+    target_cfg = cfg.target_text or {"fake": "Fake", "real": "Real"}
+    fake_token_text = cfg.fake_token or target_cfg.get("fake", "Fake")
+    real_token_text = cfg.real_token or target_cfg.get("real", "Real")
+    fake_token = first_token_id(tokenizer, fake_token_text)
+    real_token = first_token_id(tokenizer, real_token_text)
 
     all_probs = []
     all_labels = []
@@ -248,7 +207,7 @@ def evaluate(cfg: Dict) -> tuple[Dict, list[dict]]:
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Eval", dynamic_ncols=True):
-            inputs, labels, masks, paths, _ = batch
+            inputs, labels, _, paths, _ = batch
             inputs = {k: v.to(device) for k, v in inputs.items()}
             labels = labels.to(device)
 
@@ -261,7 +220,7 @@ def evaluate(cfg: Dict) -> tuple[Dict, list[dict]]:
             fusion_features = build_fusion_features(heads, fused_feature, cls_logits, hm_logits)
 
             fusion_embeds = fusion_projector(fusion_features)
-            prompt_embeds = model.get_input_embeddings()(inputs["input_ids"])
+            prompt_embeds = full_model.get_input_embeddings()(inputs["input_ids"])
             inputs_embeds = torch.cat([fusion_embeds, prompt_embeds], dim=1)
 
             attention_mask = torch.cat(
@@ -272,7 +231,7 @@ def evaluate(cfg: Dict) -> tuple[Dict, list[dict]]:
                 dim=1,
             )
 
-            outputs = model(
+            outputs = full_model(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 pixel_values=inputs["pixel_values"],
@@ -298,6 +257,9 @@ def evaluate(cfg: Dict) -> tuple[Dict, list[dict]]:
                     "predicted_label": int(pred_val),
                 })
 
+    if not all_probs:
+        raise RuntimeError("No samples were evaluated. Check the annotation file path.")
+
     y_prob = torch.cat(all_probs).numpy()
     y_true = torch.cat(all_labels).numpy().astype(int)
 
@@ -308,13 +270,18 @@ def evaluate(cfg: Dict) -> tuple[Dict, list[dict]]:
     acc = float(accuracy_score(y_true, y_pred))
     f1 = float(f1_score(y_true, y_pred))
 
-    metrics = {"timestamp": datetime.utcnow().isoformat(), "auroc": auroc, "acc": acc, "f1": f1}
+    metrics = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "auroc": auroc,
+        "acc": acc,
+        "f1": f1,
+    }
     print("Evaluation metrics:", metrics)
     return metrics, records
 
 
-def append_metrics_to_csv(cfg: Dict, metrics: Dict) -> Path:
-    csv_path = Path(cfg.get("csv_path", "task3_eval_metrics.csv"))
+def append_metrics_to_csv(cfg: HybridEvalConfig, metrics: dict) -> Path:
+    csv_path = Path(cfg.csv_path)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     file_exists = csv_path.exists()
     with open(csv_path, "a", newline="", encoding="utf-8") as f:
@@ -325,13 +292,13 @@ def append_metrics_to_csv(cfg: Dict, metrics: Dict) -> Path:
     return csv_path
 
 
-def main():
+def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
     metrics, records = evaluate(cfg)
     csv_path = append_metrics_to_csv(cfg, metrics)
-    output_name = cfg.get("output_json", "inference_results.json")
-    inference_path = csv_path.with_name(output_name)
+    inference_path = Path(cfg.output_json)
+    inference_path.parent.mkdir(parents=True, exist_ok=True)
     with inference_path.open("w", encoding="utf-8") as f:
         json.dump(records, f, ensure_ascii=False, indent=2)
     print(f"Metrics appended to {csv_path}")
