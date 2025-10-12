@@ -296,9 +296,12 @@ def evaluate(cfg: Dict):
             hm_logits = heads.evi(fused_feature)
 
             fusion_features = build_fusion_features(heads, fused_feature, cls_logits, hm_logits)
-            fusion_embeds = fusion_projector(fusion_features)
+            
 
             prompt_embeds = model.get_input_embeddings()(inputs["input_ids"])
+            target_dtype = prompt_embeds.dtype
+            fusion_embeds = fusion_projector(fusion_features).to(dtype=target_dtype)
+            prompt_embeds = prompt_embeds.to(dtype=target_dtype)
             inputs_embeds = torch.cat([fusion_embeds, prompt_embeds], dim=1)
 
             attention_mask = torch.cat(
@@ -319,7 +322,7 @@ def evaluate(cfg: Dict):
             prompt_len = inputs["input_ids"].size(1)
             next_token_logits = logits[:, fusion_tokens + prompt_len - 1, :]
             probs = torch.softmax(next_token_logits[:, [fake_token, real_token]], dim=-1)
-            fake_prob = probs[:, 0].detach().cpu()
+            fake_prob = probs[:, 0].detach().to(dtype=torch.float32, device="cpu")
             labels_cpu = labels.detach().cpu()
 
             all_probs.append(fake_prob)
