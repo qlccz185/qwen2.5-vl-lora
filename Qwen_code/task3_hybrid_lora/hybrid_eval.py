@@ -296,9 +296,11 @@ def evaluate(cfg: Dict):
             hm_logits = heads.evi(fused_feature)
 
             fusion_features = build_fusion_features(heads, fused_feature, cls_logits, hm_logits)
-            fusion_embeds = fusion_projector(fusion_features)
 
             prompt_embeds = model.get_input_embeddings()(inputs["input_ids"])
+            target_dtype = prompt_embeds.dtype
+            fusion_embeds = fusion_projector(fusion_features).to(dtype=target_dtype)
+            prompt_embeds = prompt_embeds.to(dtype=target_dtype)
             inputs_embeds = torch.cat([fusion_embeds, prompt_embeds], dim=1)
 
             attention_mask = torch.cat(
