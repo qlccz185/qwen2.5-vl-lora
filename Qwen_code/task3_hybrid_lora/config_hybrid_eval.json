@@ -48,6 +48,6 @@
   "head_checkpoint": "/root/autodl-tmp/task3_hybrid_lora/training/task3_heads.pt",
   "fusion_checkpoint": "/root/autodl-tmp/task3_hybrid_lora/training/task3_fusion.pt",
 
-  "metrics_csv": "task3_eval_metrics.csv",
-  "inference_output": "task3_inference_results.json"
+  "metrics_csv": "/root/autodl-tmp/task3_hybrid_lora/eval/task3_eval_metrics.csv",
+  "inference_output": "/root/autodl-tmp/task3_hybrid_lora/eval/task3_inference_results.json"
 }
