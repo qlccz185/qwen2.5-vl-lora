@@ -17,5 +17,5 @@
   "lora_r": 8,
   "lora_alpha": 16,
   "lora_dropout": 0.05,
-  "output_json": "/root/autodl-tmp/task4_modular_lora/subtask_vit_head_eval/inference_results.json"
+  "output_json": "inference_results.json"
 }
