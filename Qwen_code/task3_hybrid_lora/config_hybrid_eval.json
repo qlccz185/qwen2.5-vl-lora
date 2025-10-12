@@ -19,9 +19,35 @@
     31
   ],
   "fusion_tokens": 4,
+  "fusion_hidden_dropout": 0.1,
+  "lora": {
+    "r": 8,
+    "alpha": 16,
+    "dropout": 0.05,
+    "bias": "none",
+    "visual": {
+      "enabled": true,
+      "blocks": [7, 15, 23, 31],
+      "extra_patterns": ["visual.proj", "visual.attn"]
+    },
+    "lm": {
+      "enabled": true,
+      "extra_modules": [
+        "language_model.layers.24.self_attn.q_proj",
+        "language_model.layers.24.self_attn.v_proj",
+        "language_model.layers.25.self_attn.q_proj",
+        "language_model.layers.25.self_attn.v_proj",
+        "language_model.layers.26.self_attn.q_proj",
+        "language_model.layers.26.self_attn.v_proj",
+        "language_model.layers.27.self_attn.q_proj",
+        "language_model.layers.27.self_attn.v_proj"
+      ]
+    }
+  },
   "prompt": "Please determine whether this image is Real or Fake. Answer only with Fake or Real.",
-  "fake_token": " Fake",
-  "real_token": " Real",
-  "output_json": "/root/autodl-tmp/task3_hybrid_lora/evaluation/inference_results.json",
-  "mapped_dataset_path": "/root/autodl-tmp/qwen2.5-vl-lora/Qwen_code/datasets/test_dataset_mapped"
+  "target_text": {
+    "fake": "Fake",
+    "real": "Real"
+  },
+  "output_json": "/root/autodl-tmp/task3_hybrid_lora/evaluation/inference_results.json"
 }
