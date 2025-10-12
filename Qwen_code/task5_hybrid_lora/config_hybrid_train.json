@@ -7,7 +7,7 @@
   "frozen_head_path": "/root/autodl-tmp/qwen2.5-vl-lora/Qwen_head/checkpoints/best_by_AUROC_joint.pt",
 
   "seed": 42,
-  "epochs": 3,
+  "epochs": 2,
   "batch_size": 2,
   "num_workers": 4,
   "grad_accum": 1,
