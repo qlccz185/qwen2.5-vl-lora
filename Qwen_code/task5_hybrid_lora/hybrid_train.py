@@ -584,7 +584,11 @@ def save_artifacts(cfg: Dict, model, heads, fusion_projector, lm_lora_enabled: b
     lora_dir = out_dir / cfg.get("lora_checkpoint", "task3_lora")
     if lm_lora_enabled:
         print("Saving LM LoRA adapters to", lora_dir)
-        model.save_pretrained(lora_dir)
+        lora_dir.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(lora_dir, safe_serialization=True)
+        adapter_file = lora_dir / "adapter_model.safetensors"
+        if adapter_file.exists():
+            print(" - Adapter weights stored at", adapter_file)
     else:
         print("[INFO] LM LoRA disabled; skipping adapter serialization.")
 
