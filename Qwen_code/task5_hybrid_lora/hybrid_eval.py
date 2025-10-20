@@ -16,7 +16,6 @@ from tqdm import tqdm
 
 from peft import LoraConfig, PeftModel, get_peft_model
 from peft.tuners.lora import LoraLayer
-from safetensors.torch import load_file as load_safetensors
 from transformers import AutoProcessor, AutoTokenizer, Qwen2_5_VLForConditionalGeneration
 
 import sys
@@ -119,35 +118,6 @@ def build_lm_lora_config(model: nn.Module, cfg: Dict) -> Optional[LoraConfig]:
     )
 
 
-def load_lora_checkpoint(model, ckpt_path: Path):
-    if not ckpt_path.exists():
-        raise FileNotFoundError(f"LoRA checkpoint not found: {ckpt_path}")
-
-    def load_from_path(path: Path):
-        if path.suffix == ".safetensors":
-            return load_safetensors(path)
-        return torch.load(path, map_location="cpu")
-
-    if ckpt_path.is_dir():
-        candidates = [
-            ckpt_path / "adapter_model.safetensors",
-            ckpt_path / "adapter_model.bin",
-            ckpt_path / "pytorch_model.bin",
-        ]
-        adapter_path = next((p for p in candidates if p.exists()), None)
-        if adapter_path is None:
-            raise FileNotFoundError(
-                f"No adapter checkpoint found inside directory {ckpt_path}"
-            )
-        state = load_from_path(adapter_path)
-    else:
-        state = load_from_path(ckpt_path)
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing:
-        print("Missing keys when loading LoRA state:", missing)
-    if unexpected:
-        print("Unexpected keys when loading LoRA state:", unexpected)
-
 
 def _log_lora_injection(peft_model: PeftModel, scope_keyword: Optional[str] = "visual") -> None:
     """Print the modules where LoRA adapters are active for transparency."""
@@ -213,9 +183,21 @@ def build_model_and_modules(cfg: Dict):
     lm_lora_config = build_lm_lora_config(model, cfg)
     lm_lora_enabled = lm_lora_config is not None
     if lm_lora_enabled:
-        model = get_peft_model(model, lm_lora_config)
-        if cfg.get("lora_checkpoint"):
-            load_lora_checkpoint(model, Path(cfg["lora_checkpoint"]).expanduser())
+        lora_ckpt = cfg.get("lora_checkpoint")
+        if lora_ckpt:
+            adapter_path = Path(lora_ckpt).expanduser()
+            if adapter_path.is_file():
+                adapter_dir = adapter_path.parent
+            else:
+                adapter_dir = adapter_path
+            if not adapter_dir.exists():
+                raise FileNotFoundError(f"LoRA adapter directory not found: {adapter_dir}")
+            print("Loading LM LoRA adapters from", adapter_dir)
+            model = PeftModel.from_pretrained(model, adapter_dir, is_trainable=False)
+            _log_lora_injection(model, scope_keyword=None)
+        else:
+            print("[WARN] LM LoRA enabled but no lora_checkpoint provided; using randomly initialised adapters.")
+            model = get_peft_model(model, lm_lora_config)
     else:
         for param in model.parameters():
             param.requires_grad = False

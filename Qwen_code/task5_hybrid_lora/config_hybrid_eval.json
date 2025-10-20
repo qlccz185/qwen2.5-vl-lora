@@ -44,7 +44,7 @@
     }
   },
 
-  "lora_checkpoint": "/root/autodl-tmp/task5_hybrid_lora/training/task5_lora/adapter_model.safetensors",
+  "lora_checkpoint": "/root/autodl-tmp/task5_hybrid_lora/training/task5_lora",
   "head_checkpoint": "/root/autodl-tmp/qwen2.5-vl-lora/Qwen_pretrain/head/best_by_AUROC_joint_lora.pt",
   "fusion_checkpoint": "/root/autodl-tmp/task5_hybrid_lora/training/task5_fusion.pt",
 
