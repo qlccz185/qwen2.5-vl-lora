@@ -8,7 +8,7 @@ import math
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Sequence
 
 import torch
 import torch.nn as nn
