@@ -7,7 +7,7 @@
   "frozen_head_path": "/root/autodl-tmp/qwen2.5-vl-lora/Qwen_pretrain/head/best_by_AUROC_joint_lora.pt",
   "visual_lora": {
     "path": "/root/autodl-tmp/qwen2.5-vl-lora/Qwen_pretrain/lora_adapter",
-    "layers": [7, 15, 23, 31]
+    "layers": [15, 23, 31]
   },
 
   "seed": 42,
@@ -26,7 +26,7 @@
   "torch_dtype": "bfloat16",
   "image_size": 448,
 
-  "visual_layers": [7, 15, 23, 31],
+  "visual_layers": [15, 23, 31],
   "fusion_tokens": 4,
   "fusion_hidden_dropout": 0.1,
 
