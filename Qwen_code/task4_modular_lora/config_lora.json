@@ -4,7 +4,7 @@
   "data_root": "/root/autodl-tmp/data",
   "ann_train": "/root/autodl-tmp/data/trainingset2/train_idx.json",
   "out_dir": "/root/autodl-tmp/task4_modular_lora/training",
-  "head_checkpoint": "/root/autodl-tmp/qwen2.5-vl-lora/Qwen_head/checkpoints/best_by_AUROC_joint.pt",
+  "head_checkpoint": "/root/autodl-tmp/qwen2.5-vl-lora/Qwen_pretrain/head/best_by_AUROC_joint_lora.pt",
 
   "seed": 42,
   "epochs": 2,
