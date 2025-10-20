@@ -20,8 +20,8 @@
   "lora_target_layers": [
     7,15,23,31
   ],
-  "lora_r": 8,
-  "lora_alpha": 16,
+  "lora_r": 16,
+  "lora_alpha": 32,
   "lora_dropout": 0.05,
 
   "amp_dtype": "bf16",
