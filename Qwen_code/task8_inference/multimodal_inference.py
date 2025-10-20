@@ -382,14 +382,14 @@ def build_prompt(system_prompt: str, prob: float, user_prompt: str) -> str:
     label = "Fake" if prob >= 0.5 else "Real"
     return (
         f"{system_prompt.strip()}\n"
-        f"Head 预测结论：{label}（p={prob:.2f}）\n"
+        f"Head predict result：{label}（p={prob:.2f}）\n"
         f"{user_prompt.strip()}"
     )
 
 
 def select_user_prompt(user_prompt_cfg: Any, index: int, sample: Dict[str, Any]) -> str:
     if user_prompt_cfg is None:
-        return "请解释你的判断依据，并结合热力图中显著区域给出具体证据。"
+        return "Is this image tampered or authentic? Decide and give an explanation."
 
     if isinstance(user_prompt_cfg, str):
         return user_prompt_cfg

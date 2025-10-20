@@ -7,17 +7,17 @@
   },
   "head_checkpoint": "/root/autodl-tmp/qwen2.5-vl-lora/Qwen_pretrain/head/best_by_AUROC_joint_lora.pt",
   "torch_dtype": "bfloat16",
-  "system_prompt": "输入包含原图和对应的热力图。原图是进行真伪判断的主要依据；热力图仅作为辅助参考，显示了模型认为可能存在伪造的区域。当取证头判断图像为假时，请重点参考热力图中的高亮区域，分析伪造的具体位置及其判定依据；当取证头判断图像为真时，请忽略热力图，仅根据原图的整体内容和特征，给出真实性的理由与支撑。请始终以原图为核心进行判断，热力图仅用于解释伪造区域时的证据支持，不要将两者作为独立图像分别分析",
+  "system_prompt": "System Instruction: The input contains two forms of the same image: the original image and the heatmap. The original image is the primary basis for authenticity judgment, while the heatmap is an overlaid visualization of suspected manipulated regions, used only as an auxiliary reference. The heatmap is not a second image or a separate input; it is merely an annotation layer on top of the original image, showing areas the model detects as potentially forged. When the forensic head determines the image is fake, focus your analysis on the original image while referring to the highlighted regions in the heatmap to explain the specific manipulation areas and reasoning. When the forensic head determines the image is real, ignore the heatmap and provide the reasoning for authenticity based solely on the overall content and characteristics of the original image. Do not describe the original image and the heatmap as two separate images, and avoid using phrases such as 'the first image', 'the second image', or 'differences between two images'. Your explanation must always center on a single original image, with the heatmap serving only as overlaid visual evidence for interpretability. At the beginning of your response, explicitly state the classification result (Fake or Real) based on the prompt-provided prediction.",
   "chat_system_prompt": "You are a professional AI visual forensic analyst. Your task is to analyze an image and its corresponding heatmap, identify whether the content is authentic or manipulated, and provide a clear, structured, and evidence-based explanation for your judgment. Use precise and objective language. Avoid repetition or subjective phrases.",
   "user_prompt": {
     "strategy": "random",
-    "options": [
-      "请解释你的判断依据，并结合热力图中显著区域列出两到三条证据。",
-      "请总结模型的真假结论，并说明证据图中高亮区域反映了哪些可疑细节。",
-      "请根据原图与证据图给出最终结论，指出至少两个支持该结论的视觉线索。",
-      "请围绕热力图中最明显的区域，说明它们如何影响真假判定，并给出整体结论。",
-      "请按照条目列出关键视觉证据，同时解释这些证据如何支撑真假判断。",
-      "请描述模型的最终判断，并结合证据图阐述伪造或真实的理由。"
+    "options":[
+      "Is this image tampered or authentic? Decide and give an explanation.",
+      "Inspect the image. First list 2–3 localized, verifiable cues, then decide REAL or FAKE and add an explanation.",
+      "Decide whether the image is authentic or tampered. Analyze and describe authenticity cues from local to global, listing verifiable cues before giving your final judgment and explanation.",
+      "Decide whether the image is authentic or tampered. Begin with your verdict, then analyze authenticity cues from local to global, providing verifiable cues as justification.",
+      "Determine whether this image has been AI-tampered and provide a complete causal chain as your explanation.",
+      "Evaluate whether the image has been AI-tampered across the following tiers. Cover at least two tiers, and provide localized cues for each one you select: LOW: texture, edges, clarity, distortion, overall hue; MID: light and shadow, shape, content deficiency, symmetry, reflection; HIGH: layout, perspective, theme, irreality."
     ]
   },
   "data": {
