@@ -257,6 +257,9 @@ def build_dataloader(processor, cfg: Dict) -> DataLoader:
     batch_size = cfg.get("batch_size", 2)
     num_workers = cfg.get("num_workers", 4)
     image_size = cfg.get("image_size", 448)
+    prompt_text = cfg.get("prompt", ".")
+    if not isinstance(prompt_text, str) or not prompt_text:
+        prompt_text = "."
 
     return DataLoader(
         dataset,
@@ -264,7 +267,12 @@ def build_dataloader(processor, cfg: Dict) -> DataLoader:
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
-        collate_fn=lambda batch: collate_joint_test(batch, processor, image_size),
+        collate_fn=lambda batch: collate_joint_test(
+            batch,
+            processor,
+            image_size,
+            prompt_text=prompt_text,
+        ),
     )
 
 

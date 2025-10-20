@@ -30,6 +30,8 @@
   "fusion_tokens": 4,
   "fusion_hidden_dropout": 0.1,
 
+  "prompt": "Please determine whether this image is Real or Fake. Answer only with Fake or Real.",
+
   "target_text": {
     "fake": "Fake",
     "real": "Real"

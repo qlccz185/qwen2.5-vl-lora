@@ -136,12 +136,21 @@ class ForgeryJointValDataset(Dataset):
         return {"image": img, "label": y, "mask": m, "path": rec["path"]}
 
 # Collate（固定 448）
-def collate_joint_test(batch, processor, fixed_res=448):
+def collate_joint_test(batch, processor, fixed_res=448, prompt_text: str = "."):
     messages, masks, labels, paths, vis_imgs = [], [], [], [], []
     for rec in batch:
         im448 = resize_square_pad_rgb(rec["image"], fixed_res)
         vis_imgs.append(im448)  # 可视化
-        messages.append({"role":"user","content":[{"type":"image","image":im448},{"type":"text","text":"."}]})
+        prompt_value = prompt_text if isinstance(prompt_text, str) and prompt_text else "."
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": im448},
+                    {"type": "text", "text": prompt_value},
+                ],
+            }
+        )
 
         m = rec["mask"]
         m_res = resize_square_pad_mask(m, fixed_res)
