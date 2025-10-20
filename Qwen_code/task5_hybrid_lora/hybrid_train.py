@@ -8,7 +8,7 @@ import math
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import (
     AutoProcessor,
     AutoTokenizer,
@@ -95,42 +95,21 @@ def find_modules_by_patterns(model: nn.Module, patterns: Sequence[str]) -> List[
     return sorted(matches)
 
 
-def build_lora_config(model: nn.Module, cfg: Dict) -> LoraConfig:
+def build_lm_lora_config(model: nn.Module, cfg: Dict) -> Optional[LoraConfig]:
     lora_cfg = cfg.get("lora", {})
-    target_modules: set[str] = set(lora_cfg.get("target_modules", []))
-
-    # visual backbone blocks
-    visual_cfg = lora_cfg.get("visual", {})
-    if visual_cfg.get("enabled", False):
-        for idx in visual_cfg.get("blocks", []):
-            target_modules.update(
-                [
-                    f"visual.blocks.{idx}.attn.qkv",
-                    f"visual.blocks.{idx}.attn.proj",
-                    f"visual.blocks.{idx}.mlp.gate_proj",
-                    f"visual.blocks.{idx}.mlp.up_proj",
-                    f"visual.blocks.{idx}.mlp.down_proj",
-                ]
-            )
-        target_modules.update(find_modules_by_patterns(model, visual_cfg.get("extra_patterns", [])))
-        target_modules.update(visual_cfg.get("extra_modules", []))
-
-    # merge modules between vision and language
-    merge_cfg = lora_cfg.get("merge", {})
-    if merge_cfg.get("enabled", False):
-        target_modules.update(find_modules_by_patterns(model, merge_cfg.get("module_patterns", [])))
-        target_modules.update(merge_cfg.get("extra_modules", []))
-
-    # language model stack
     lm_cfg = lora_cfg.get("lm", {})
-    if lm_cfg.get("enabled", False):
-        target_modules.update(find_modules_by_patterns(model, lm_cfg.get("module_patterns", [])))
-        target_modules.update(lm_cfg.get("extra_modules", []))
+    if not lm_cfg.get("enabled", False):
+        print("[INFO] LM LoRA is disabled via configuration.")
+        return None
+
+    target_modules: set[str] = set(lm_cfg.get("target_modules", []))
+    target_modules.update(find_modules_by_patterns(model, lm_cfg.get("module_patterns", [])))
+    target_modules.update(lm_cfg.get("extra_modules", []))
 
     if not target_modules:
-        raise ValueError("No LoRA target modules were resolved. Please check config.lora settings.")
+        raise ValueError("LM LoRA enabled but no target modules were resolved from configuration.")
 
-    print("LoRA target modules ({}):".format(len(target_modules)))
+    print("LM LoRA target modules ({}):".format(len(target_modules)))
     for name in sorted(target_modules):
         print(" -", name)
 
@@ -142,6 +121,27 @@ def build_lora_config(model: nn.Module, cfg: Dict) -> LoraConfig:
         bias=lora_cfg.get("bias", "none"),
         task_type="CAUSAL_LM",
     )
+
+
+def load_visual_lora_weights(model: nn.Module, cfg: Dict) -> nn.Module:
+    visual_cfg = cfg.get("visual_lora", {})
+    adapter_path = visual_cfg.get("path") or cfg.get("visual_lora_path")
+    if not adapter_path:
+        raise ValueError("Configuration must include visual_lora.path for pretrained vision adapters.")
+
+    adapter_dir = Path(adapter_path).expanduser()
+    if adapter_dir.is_file():
+        adapter_dir = adapter_dir.parent
+    if not adapter_dir.exists():
+        raise FileNotFoundError(f"Visual LoRA adapter directory not found: {adapter_dir}")
+
+    print("Loading pretrained visual LoRA from", adapter_dir)
+    if visual_cfg.get("layers"):
+        print(" - Visual LoRA layers:", visual_cfg.get("layers"))
+    peft_model = PeftModel.from_pretrained(model, adapter_dir, is_trainable=False)
+    print("Merging visual LoRA weights into the base model and freezing them.")
+    merged_model = peft_model.merge_and_unload()
+    return merged_model
 
 
 def load_frozen_head_weights(heads: ForensicJoint, checkpoint_path: str, device: torch.device) -> None:
@@ -176,10 +176,21 @@ def build_model_and_tools(cfg: Dict):
         base_model_path,
         torch_dtype=torch_dtype,
     )
-    model.enable_input_require_grads()
 
-    lora_config = build_lora_config(model, cfg)
-    model = get_peft_model(model, lora_config)
+    model = load_visual_lora_weights(model, cfg)
+
+    lm_lora_config = build_lm_lora_config(model, cfg)
+    lm_lora_enabled = lm_lora_config is not None
+    if lm_lora_enabled:
+        model.enable_input_require_grads()
+        model = get_peft_model(model, lm_lora_config)
+    else:
+        for param in model.parameters():
+            param.requires_grad = False
+
+    # ensure forward pass keeps gradients for custom embeddings even when LM LoRA disabled
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
 
     processor = AutoProcessor.from_pretrained(base_model_path)
     tokenizer = AutoTokenizer.from_pretrained(base_model_path)
@@ -191,7 +202,8 @@ def build_model_and_tools(cfg: Dict):
     model.to(device)
 
     base_model = model.get_base_model() if hasattr(model, "get_base_model") else model
-    visual_layers = tuple(cfg.get("visual_layers", [7, 15, 23, 31]))
+    visual_cfg = cfg.get("visual_lora", {})
+    visual_layers = tuple(visual_cfg.get("layers") or cfg.get("visual_layers", [7, 15, 23, 31]))
     visual_tap = QwenVisualTap(base_model.visual, layers=visual_layers).to(device)
     heads = ForensicJoint(layers=visual_layers).to(device)
 
@@ -209,7 +221,7 @@ def build_model_and_tools(cfg: Dict):
         dropout=cfg.get("fusion_hidden_dropout", 0.1),
     ).to(device)
 
-    return model, processor, tokenizer, visual_tap, heads, fusion_projector, device
+    return model, processor, tokenizer, visual_tap, heads, fusion_projector, device, lm_lora_enabled
 
 
 def build_dataloader(processor, cfg: Dict) -> DataLoader:
@@ -353,7 +365,16 @@ def prepare_lm_inputs(
 
 def train(cfg: Dict):
     prepare_environment(cfg)
-    model, processor, tokenizer, visual_tap, heads, fusion_projector, device = build_model_and_tools(cfg)
+    (
+        model,
+        processor,
+        tokenizer,
+        visual_tap,
+        heads,
+        fusion_projector,
+        device,
+        lm_lora_enabled,
+    ) = build_model_and_tools(cfg)
     dataloader = build_dataloader(processor, cfg)
 
     grad_accum = cfg.get("grad_accum", 1)
@@ -364,14 +385,25 @@ def train(cfg: Dict):
     warmup_steps = int(total_steps * warmup_ratio)
 
     params_fusion = [p for p in fusion_projector.parameters() if p.requires_grad]
-    params_lora = [p for p in model.parameters() if p.requires_grad]
+    params_lora = [p for p in model.parameters() if p.requires_grad] if lm_lora_enabled else []
 
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": params_fusion, "lr": cfg.get("lr_fusion", 5e-4), "weight_decay": cfg.get("weight_decay", 0.0)},
-            {"params": params_lora, "lr": cfg.get("lr_lora", 1e-4), "weight_decay": 0.0},
-        ]
-    )
+    optim_groups = [
+        {
+            "params": params_fusion,
+            "lr": cfg.get("lr_fusion", 5e-4),
+            "weight_decay": cfg.get("weight_decay", 0.0),
+        }
+    ]
+    if params_lora:
+        optim_groups.append(
+            {
+                "params": params_lora,
+                "lr": cfg.get("lr_lora", 1e-4),
+                "weight_decay": 0.0,
+            }
+        )
+
+    optimizer = torch.optim.AdamW(optim_groups)
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=warmup_steps,
@@ -514,16 +546,19 @@ def train(cfg: Dict):
                 )
                 f.flush()
 
-    save_artifacts(cfg, model, heads, fusion_projector)
+    save_artifacts(cfg, model, heads, fusion_projector, lm_lora_enabled)
 
 
-def save_artifacts(cfg: Dict, model, heads, fusion_projector):
+def save_artifacts(cfg: Dict, model, heads, fusion_projector, lm_lora_enabled: bool):
     out_dir = Path(cfg.get("output_dir", "outputs_task3"))
     out_dir.mkdir(parents=True, exist_ok=True)
 
     lora_dir = out_dir / cfg.get("lora_checkpoint", "task3_lora")
-    print("Saving LoRA adapters to", lora_dir)
-    model.save_pretrained(lora_dir)
+    if lm_lora_enabled:
+        print("Saving LM LoRA adapters to", lora_dir)
+        model.save_pretrained(lora_dir)
+    else:
+        print("[INFO] LM LoRA disabled; skipping adapter serialization.")
 
     head_snapshot_name = cfg.get("head_snapshot")
     if head_snapshot_name:

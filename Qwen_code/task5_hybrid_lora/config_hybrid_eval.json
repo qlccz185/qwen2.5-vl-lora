@@ -19,16 +19,16 @@
     "real": "Real"
   },
 
+  "visual_lora": {
+    "path": "/root/autodl-tmp/qwen2.5-vl-lora/Qwen_pretrain/lora_adapter",
+    "layers": [7, 15, 23, 31]
+  },
+
   "lora": {
     "r": 8,
     "alpha": 16,
     "dropout": 0.05,
     "bias": "none",
-    "visual": {
-      "enabled": true,
-      "blocks": [7, 15, 23, 31],
-      "extra_patterns": ["visual.proj", "visual.attn"]
-    },
     "lm": {
       "enabled": true,
       "extra_modules": [
@@ -45,7 +45,7 @@
   },
 
   "lora_checkpoint": "/root/autodl-tmp/task5_hybrid_lora/training/task5_lora/adapter_model.safetensors",
-  "head_checkpoint": "/root/autodl-tmp/qwen2.5-vl-lora/Qwen_head/checkpoints/best_by_AUROC_joint.pt",
+  "head_checkpoint": "/root/autodl-tmp/qwen2.5-vl-lora/Qwen_pretrain/head/best_by_AUROC_joint_lora.pt",
   "fusion_checkpoint": "/root/autodl-tmp/task5_hybrid_lora/training/task5_fusion.pt",
 
   "metrics_csv": "/root/autodl-tmp/task5_hybrid_lora/eval/task5_eval_metrics.csv",

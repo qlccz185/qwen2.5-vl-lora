@@ -7,14 +7,14 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Sequence
+from typing import Dict, Optional, Sequence
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model
 from safetensors.torch import load_file as load_safetensors
 from transformers import AutoProcessor, AutoTokenizer, Qwen2_5_VLForConditionalGeneration
 
@@ -90,39 +90,21 @@ def find_modules_by_patterns(model: nn.Module, patterns: Sequence[str]) -> list[
     return sorted(matches)
 
 
-def build_lora_config(model: nn.Module, cfg: Dict) -> LoraConfig:
+def build_lm_lora_config(model: nn.Module, cfg: Dict) -> Optional[LoraConfig]:
     lora_cfg = cfg.get("lora", {})
-    target_modules: set[str] = set(lora_cfg.get("target_modules", []))
-
-    visual_cfg = lora_cfg.get("visual", {})
-    if visual_cfg.get("enabled", False):
-        for idx in visual_cfg.get("blocks", []):
-            target_modules.update(
-                [
-                    f"visual.blocks.{idx}.attn.qkv",
-                    f"visual.blocks.{idx}.attn.proj",
-                    f"visual.blocks.{idx}.mlp.gate_proj",
-                    f"visual.blocks.{idx}.mlp.up_proj",
-                    f"visual.blocks.{idx}.mlp.down_proj",
-                ]
-            )
-        target_modules.update(find_modules_by_patterns(model, visual_cfg.get("extra_patterns", [])))
-        target_modules.update(visual_cfg.get("extra_modules", []))
-
-    merge_cfg = lora_cfg.get("merge", {})
-    if merge_cfg.get("enabled", False):
-        target_modules.update(find_modules_by_patterns(model, merge_cfg.get("module_patterns", [])))
-        target_modules.update(merge_cfg.get("extra_modules", []))
-
     lm_cfg = lora_cfg.get("lm", {})
-    if lm_cfg.get("enabled", False):
-        target_modules.update(find_modules_by_patterns(model, lm_cfg.get("module_patterns", [])))
-        target_modules.update(lm_cfg.get("extra_modules", []))
+    if not lm_cfg.get("enabled", False):
+        print("[INFO] LM LoRA disabled during evaluation.")
+        return None
+
+    target_modules: set[str] = set(lm_cfg.get("target_modules", []))
+    target_modules.update(find_modules_by_patterns(model, lm_cfg.get("module_patterns", [])))
+    target_modules.update(lm_cfg.get("extra_modules", []))
 
     if not target_modules:
-        raise ValueError("No LoRA target modules were resolved. Please check config.lora settings.")
+        raise ValueError("LM LoRA enabled but no target modules were resolved from configuration.")
 
-    print("LoRA target modules ({}):".format(len(target_modules)))
+    print("LM LoRA target modules ({}):".format(len(target_modules)))
     for name in sorted(target_modules):
         print(" -", name)
 
@@ -166,6 +148,27 @@ def load_lora_checkpoint(model, ckpt_path: Path):
         print("Unexpected keys when loading LoRA state:", unexpected)
 
 
+def load_visual_lora_weights(model: nn.Module, cfg: Dict) -> nn.Module:
+    visual_cfg = cfg.get("visual_lora", {})
+    adapter_path = visual_cfg.get("path") or cfg.get("visual_lora_path")
+    if not adapter_path:
+        raise ValueError("Configuration must include visual_lora.path for pretrained vision adapters.")
+
+    adapter_dir = Path(adapter_path).expanduser()
+    if adapter_dir.is_file():
+        adapter_dir = adapter_dir.parent
+    if not adapter_dir.exists():
+        raise FileNotFoundError(f"Visual LoRA adapter directory not found: {adapter_dir}")
+
+    print("Loading pretrained visual LoRA from", adapter_dir)
+    if visual_cfg.get("layers"):
+        print(" - Visual LoRA layers:", visual_cfg.get("layers"))
+    peft_model = PeftModel.from_pretrained(model, adapter_dir, is_trainable=False)
+    print("Merging visual LoRA weights into the base model for evaluation.")
+    merged_model = peft_model.merge_and_unload()
+    return merged_model
+
+
 def build_model_and_modules(cfg: Dict):
     dtype_name = cfg.get("torch_dtype")
     torch_dtype = getattr(torch, dtype_name) if dtype_name else torch.bfloat16
@@ -177,11 +180,17 @@ def build_model_and_modules(cfg: Dict):
         torch_dtype=torch_dtype,
     )
 
-    lora_config = build_lora_config(model, cfg)
-    model = get_peft_model(model, lora_config)
+    model = load_visual_lora_weights(model, cfg)
 
-    if cfg.get("lora_checkpoint"):
-        load_lora_checkpoint(model, Path(cfg["lora_checkpoint"]).expanduser())
+    lm_lora_config = build_lm_lora_config(model, cfg)
+    lm_lora_enabled = lm_lora_config is not None
+    if lm_lora_enabled:
+        model = get_peft_model(model, lm_lora_config)
+        if cfg.get("lora_checkpoint"):
+            load_lora_checkpoint(model, Path(cfg["lora_checkpoint"]).expanduser())
+    else:
+        for param in model.parameters():
+            param.requires_grad = False
 
     processor = AutoProcessor.from_pretrained(base_model_path)
     tokenizer = AutoTokenizer.from_pretrained(base_model_path)
@@ -194,7 +203,8 @@ def build_model_and_modules(cfg: Dict):
     model.eval()
 
     base_model = model.get_base_model() if hasattr(model, "get_base_model") else model
-    visual_layers = tuple(int(v) for v in cfg.get("visual_layers", [7, 15, 23, 31]))
+    visual_cfg = cfg.get("visual_lora", {})
+    visual_layers = tuple(int(v) for v in (visual_cfg.get("layers") or cfg.get("visual_layers", [7, 15, 23, 31])))
     visual_tap = QwenVisualTap(base_model.visual, layers=visual_layers).to(device)
     heads = ForensicJoint(layers=visual_layers).to(device)
 
@@ -228,7 +238,7 @@ def build_model_and_modules(cfg: Dict):
         fusion_projector.load_state_dict(torch.load(fusion_path, map_location=device))
     fusion_projector.eval()
 
-    return model, processor, tokenizer, visual_tap, heads, fusion_projector, device
+    return model, processor, tokenizer, visual_tap, heads, fusion_projector, device, lm_lora_enabled
 
 
 def build_dataloader(processor, cfg: Dict) -> DataLoader:
@@ -281,7 +291,16 @@ def resolve_label_tokens(tokenizer, cfg: Dict) -> tuple[int, int]:
 
 def evaluate(cfg: Dict):
     prepare_environment(cfg)
-    model, processor, tokenizer, visual_tap, heads, fusion_projector, device = build_model_and_modules(cfg)
+    (
+        model,
+        processor,
+        tokenizer,
+        visual_tap,
+        heads,
+        fusion_projector,
+        device,
+        _lm_lora_enabled,
+    ) = build_model_and_modules(cfg)
     dataloader = build_dataloader(processor, cfg)
 
     fusion_tokens = int(cfg.get("fusion_tokens", 4))
