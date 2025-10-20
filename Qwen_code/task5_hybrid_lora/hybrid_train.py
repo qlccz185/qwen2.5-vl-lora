@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from peft import LoraConfig, PeftModel, get_peft_model
+from peft.tuners.lora import LoraLayer
 from transformers import (
     AutoProcessor,
     AutoTokenizer,
@@ -123,6 +124,32 @@ def build_lm_lora_config(model: nn.Module, cfg: Dict) -> Optional[LoraConfig]:
     )
 
 
+def _log_lora_injection(peft_model: PeftModel, scope_keyword: Optional[str] = "visual") -> None:
+    """Print the modules where LoRA adapters are active for transparency."""
+
+    try:
+        base_model = peft_model.get_base_model()
+    except AttributeError:
+        base_model = peft_model
+
+    injected: List[str] = []
+    for name, module in base_model.named_modules():
+        if isinstance(module, LoraLayer):
+            if scope_keyword and scope_keyword not in name:
+                continue
+            injected.append(name)
+
+    unique_modules = sorted(set(injected))
+    if not unique_modules:
+        scope_msg = f" containing '{scope_keyword}'" if scope_keyword else ""
+        print(f"[WARN] No LoRA modules detected on the base model{scope_msg}.")
+        return
+
+    print(f"Visual LoRA injected into {len(unique_modules)} modules:")
+    for module_name in unique_modules:
+        print(" -", module_name)
+
+
 def load_visual_lora_weights(model: nn.Module, cfg: Dict) -> nn.Module:
     visual_cfg = cfg.get("visual_lora", {})
     adapter_path = visual_cfg.get("path") or cfg.get("visual_lora_path")
@@ -139,6 +166,7 @@ def load_visual_lora_weights(model: nn.Module, cfg: Dict) -> nn.Module:
     if visual_cfg.get("layers"):
         print(" - Visual LoRA layers:", visual_cfg.get("layers"))
     peft_model = PeftModel.from_pretrained(model, adapter_dir, is_trainable=False)
+    _log_lora_injection(peft_model, scope_keyword="visual")
     print("Merging visual LoRA weights into the base model and freezing them.")
     merged_model = peft_model.merge_and_unload()
     return merged_model

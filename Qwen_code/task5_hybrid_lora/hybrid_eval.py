@@ -7,7 +7,7 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from peft import LoraConfig, PeftModel, get_peft_model
+from peft.tuners.lora import LoraLayer
 from safetensors.torch import load_file as load_safetensors
 from transformers import AutoProcessor, AutoTokenizer, Qwen2_5_VLForConditionalGeneration
 
@@ -148,6 +149,32 @@ def load_lora_checkpoint(model, ckpt_path: Path):
         print("Unexpected keys when loading LoRA state:", unexpected)
 
 
+def _log_lora_injection(peft_model: PeftModel, scope_keyword: Optional[str] = "visual") -> None:
+    """Print the modules where LoRA adapters are active for transparency."""
+
+    try:
+        base_model = peft_model.get_base_model()
+    except AttributeError:
+        base_model = peft_model
+
+    injected: List[str] = []
+    for name, module in base_model.named_modules():
+        if isinstance(module, LoraLayer):
+            if scope_keyword and scope_keyword not in name:
+                continue
+            injected.append(name)
+
+    unique_modules = sorted(set(injected))
+    if not unique_modules:
+        scope_msg = f" containing '{scope_keyword}'" if scope_keyword else ""
+        print(f"[WARN] No LoRA modules detected on the base model{scope_msg}.")
+        return
+
+    print(f"Visual LoRA injected into {len(unique_modules)} modules:")
+    for module_name in unique_modules:
+        print(" -", module_name)
+
+
 def load_visual_lora_weights(model: nn.Module, cfg: Dict) -> nn.Module:
     visual_cfg = cfg.get("visual_lora", {})
     adapter_path = visual_cfg.get("path") or cfg.get("visual_lora_path")
@@ -164,6 +191,7 @@ def load_visual_lora_weights(model: nn.Module, cfg: Dict) -> nn.Module:
     if visual_cfg.get("layers"):
         print(" - Visual LoRA layers:", visual_cfg.get("layers"))
     peft_model = PeftModel.from_pretrained(model, adapter_dir, is_trainable=False)
+    _log_lora_injection(peft_model, scope_keyword="visual")
     print("Merging visual LoRA weights into the base model for evaluation.")
     merged_model = peft_model.merge_and_unload()
     return merged_model
