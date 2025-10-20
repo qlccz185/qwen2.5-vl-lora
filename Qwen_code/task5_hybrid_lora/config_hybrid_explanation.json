@@ -1,0 +1,66 @@
+{
+  "working_dir": "/root/autodl-tmp/qwen2.5-vl-lora/Qwen_code",
+  "base_model_path": "/root/autodl-tmp/Qwen2.5-VL-7B-Instruct",
+  "data_root": "/root/autodl-tmp/data",
+  "ann_eval": "/root/autodl-tmp/data/testset2/annotation.json",
+
+  "seed": 42,
+  "batch_size": 2,
+  "num_workers": 4,
+  "torch_dtype": "bfloat16",
+  "image_size": 448,
+
+  "visual_layers": [15, 23, 31],
+  "fusion_tokens": 4,
+  "fusion_hidden_dropout": 0.1,
+
+  "prompt_candidates": [
+    "Is this image tampered or authentic? Decide and give an explanation.",
+    "Inspect the image. First list 2–3 localized, verifiable cues, then decide REAL or FAKE and add an explanation.",
+    "Decide whether the image is authentic or tampered. Analyze and describe authenticity cues from local to global, listing verifiable cues before giving your final judgment and explanation.",
+    "Decide whether the image is authentic or tampered. Begin with your verdict, then analyze authenticity cues from local to global, providing verifiable cues as justification.",
+    "Determine whether this image has been AI-tampered and provide a complete causal chain as your explanation.",
+    "Evaluate whether the image has been AI-tampered across the following tiers. Cover at least two tiers, and provide localized cues for each one you select: LOW: texture, edges, clarity, distortion, overall hue MID: light and shadow, shape, content deficiency, symmetry, reflection HIGH: layout, perspective, theme, irreality"
+  ],
+
+  "target_text": {
+    "fake": "Fake",
+    "real": "Real"
+  },
+
+  "visual_lora": {
+    "path": "/root/autodl-tmp/qwen2.5-vl-lora/Qwen_pretrain/lora_adapter",
+    "layers": [15, 23, 31]
+  },
+
+  "lora": {
+    "r": 8,
+    "alpha": 16,
+    "dropout": 0.05,
+    "bias": "none",
+    "lm": {
+      "enabled": true,
+      "extra_modules": [
+        "language_model.layers.24.self_attn.q_proj",
+        "language_model.layers.24.self_attn.v_proj",
+        "language_model.layers.25.self_attn.q_proj",
+        "language_model.layers.25.self_attn.v_proj",
+        "language_model.layers.26.self_attn.q_proj",
+        "language_model.layers.26.self_attn.v_proj",
+        "language_model.layers.27.self_attn.q_proj",
+        "language_model.layers.27.self_attn.v_proj"
+      ]
+    }
+  },
+
+  "lora_checkpoint": "/root/autodl-tmp/task5_hybrid_lora/training/task5_lora",
+  "head_checkpoint": "/root/autodl-tmp/qwen2.5-vl-lora/Qwen_pretrain/head/best_by_AUROC_joint_lora.pt",
+  "fusion_checkpoint": "/root/autodl-tmp/task5_hybrid_lora/training/task5_fusion.pt",
+
+  "inference_output": "/root/autodl-tmp/task5_hybrid_lora/explanation/task5_explanation_results.csv",
+
+  "max_new_tokens": 128,
+  "do_sample": false,
+  "temperature": 0.7,
+  "top_p": 0.9
+}

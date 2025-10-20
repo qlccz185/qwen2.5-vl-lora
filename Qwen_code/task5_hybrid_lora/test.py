@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os, json, math, argparse, random
+from typing import Sequence
 from pathlib import Path
 import numpy as np
 from PIL import Image
@@ -136,18 +137,33 @@ class ForgeryJointValDataset(Dataset):
         return {"image": img, "label": y, "mask": m, "path": rec["path"]}
 
 # Collate（固定 448）
-def collate_joint_test(batch, processor, fixed_res=448, prompt_text: str = "."):
-    messages, masks, labels, paths, vis_imgs = [], [], [], [], []
-    for rec in batch:
+def collate_joint_test(
+    batch,
+    processor,
+    fixed_res=448,
+    prompt_text: str | Sequence[str] = ".",
+    return_prompts: bool = False,
+):
+    messages, masks, labels, paths, vis_imgs, prompts_used = [], [], [], [], [], []
+
+    if isinstance(prompt_text, (list, tuple)):
+        if len(prompt_text) != len(batch):
+            raise ValueError("prompt_text sequence length must match batch size.")
+        prompt_values = list(prompt_text)
+    else:
+        prompt_values = [prompt_text] * len(batch)
+
+    for rec, prompt_value in zip(batch, prompt_values):
         im448 = resize_square_pad_rgb(rec["image"], fixed_res)
         vis_imgs.append(im448)  # 可视化
-        prompt_value = prompt_text if isinstance(prompt_text, str) and prompt_text else "."
+        prompt_str = prompt_value if isinstance(prompt_value, str) and prompt_value else "."
+        prompts_used.append(prompt_str)
         messages.append(
             {
                 "role": "user",
                 "content": [
                     {"type": "image", "image": im448},
-                    {"type": "text", "text": prompt_value},
+                    {"type": "text", "text": prompt_str},
                 ],
             }
         )
@@ -173,6 +189,8 @@ def collate_joint_test(batch, processor, fixed_res=448, prompt_text: str = "."):
 
     labels = torch.tensor(labels, dtype=torch.float32)
     masks  = torch.from_numpy(np.stack(masks, axis=0))  # [B,H,W] in {0,1}
+    if return_prompts:
+        return inputs, labels, masks, paths, vis_imgs, prompts_used
     return inputs, labels, masks, paths, vis_imgs
 
 # Visual Tap（与训练一致）
