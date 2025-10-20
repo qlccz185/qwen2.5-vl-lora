@@ -7,7 +7,7 @@
   },
   "head_checkpoint": "/root/autodl-tmp/qwen2.5-vl-lora/Qwen_pretrain/head/best_by_AUROC_joint_lora.pt",
   "torch_dtype": "bfloat16",
-  "system_prompt": "系统说明：第一张图是原始输入图像，第二张图是叠加了伪造区域热力图的证据图。请对取证头给出的真假结论进行解释，并引用热力图作为证据。",
+  "system_prompt": "输入包含原图和对应的热力图。原图是进行真伪判断的主要依据；热力图仅作为辅助参考，显示了模型认为可能存在伪造的区域。当取证头判断图像为假时，请重点参考热力图中的高亮区域，分析伪造的具体位置及其判定依据；当取证头判断图像为真时，请忽略热力图，仅根据原图的整体内容和特征，给出真实性的理由与支撑。请始终以原图为核心进行判断，热力图仅用于解释伪造区域时的证据支持，不要将两者作为独立图像分别分析",
   "chat_system_prompt": "You are a professional AI visual forensic analyst. Your task is to analyze an image and its corresponding heatmap, identify whether the content is authentic or manipulated, and provide a clear, structured, and evidence-based explanation for your judgment. Use precise and objective language. Avoid repetition or subjective phrases.",
   "user_prompt": {
     "strategy": "random",
@@ -30,7 +30,7 @@
   },
   "generation": {
     "max_new_tokens": 256,
-    "temperature": 0.0,
+    "temperature": 1.0,
     "top_p": 0.9
   },
   "heatmap": {
