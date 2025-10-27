@@ -21,6 +21,16 @@ from peft import PeftModel
 from peft.tuners.lora import LoraLayer
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
+try:
+    from Qwen_code.task7_vit_lora_eval.test import resize_square_pad_rgb
+except ImportError:  # pragma: no cover - fallback for direct script execution
+    import sys
+
+    _TASK7_DIR = Path(__file__).resolve().parent.parent / "task7_vit_lora_eval"
+    if str(_TASK7_DIR) not in sys.path:
+        sys.path.append(str(_TASK7_DIR))
+    from test import resize_square_pad_rgb  # type: ignore  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # Vision taps and forensic head (copied and simplified from previous tasks)
@@ -322,28 +332,33 @@ def run_forensic_head(
     head: ForensicHead,
     device: torch.device,
 ) -> Tuple[float, torch.Tensor]:
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image},
-                {"type": "text", "text": "."},
-            ],
-        }
-    ]
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-    inputs = processor(text=[text], images=[[image]], return_tensors="pt", padding=True)
+    padded_image = resize_square_pad_rgb(image, size=448)
+    message = {
+        "role": "user",
+        "content": [
+            {"type": "image", "image": padded_image},
+            {"type": "text", "text": "."},
+        ],
+    }
+    chat_text = processor.apply_chat_template([message], tokenize=False, add_generation_prompt=True)
+    inputs = processor(text=[chat_text], images=[padded_image], return_tensors="pt", padding=True)
     pixel_values = inputs["pixel_values"].to(device)
     image_grid_thw = inputs["image_grid_thw"].to(device)
 
     with torch.inference_mode():
         grid_dict = visual_tap(pixel_values, image_grid_thw)
-        grid_dict = {k: v.float().to(device) for k, v in grid_dict.items()}
+        grid_dict = {k: v.float() for k, v in grid_dict.items()}
         logits, heatmap_logits = head(grid_dict)
         prob = torch.sigmoid(logits)[0].item()
         if heatmap_logits.dim() == 3:
             heatmap_logits = heatmap_logits.unsqueeze(1)
         heatmap_prob = torch.sigmoid(heatmap_logits)
+        heatmap_prob = F.interpolate(
+            heatmap_prob,
+            size=(448, 448),
+            mode="bilinear",
+            align_corners=False,
+        )
 
     heatmap_prob = heatmap_prob.detach().cpu()[0, 0]
     return prob, heatmap_prob
