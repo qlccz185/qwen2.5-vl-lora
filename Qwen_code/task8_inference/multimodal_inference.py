@@ -335,18 +335,21 @@ def run_forensic_head(
     else:
         B, _, H, W = pixel_values.shape
         patch = 14
-        image_grid_thw = torch.tensor([[B, H // patch, W // patch]], device=device)
+        image_grid_thw = torch.tensor(
+            [[B, H // patch, W // patch]], device=device, dtype=torch.int32
+        )
 
-    with torch.inference_mode():
+    with torch.no_grad():
         grid_dict = visual_tap(pixel_values, image_grid_thw)
         grid_dict = {k: v.float().to(device) for k, v in grid_dict.items()}
         cls_logits, heatmap_logits = head(grid_dict)
-        prob = torch.sigmoid(cls_logits).detach().to(torch.float32).cpu().item()
+        prob_tensor = torch.sigmoid(cls_logits).detach().to(device="cpu", dtype=torch.float32)
+        prob = prob_tensor.item()
         if heatmap_logits.dim() == 3:
             heatmap_logits = heatmap_logits.unsqueeze(1)
-        heatmap_prob = torch.sigmoid(heatmap_logits)
+        heatmap_prob = torch.sigmoid(heatmap_logits).detach().cpu()
 
-    heatmap_prob = heatmap_prob.detach().cpu()[0, 0]
+    heatmap_prob = heatmap_prob[0, 0]
     return prob, heatmap_prob
 
 
