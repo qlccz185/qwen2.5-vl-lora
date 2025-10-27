@@ -322,25 +322,26 @@ def run_forensic_head(
     head: ForensicHead,
     device: torch.device,
 ) -> Tuple[float, torch.Tensor]:
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image},
-                {"type": "text", "text": "."},
-            ],
-        }
-    ]
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-    inputs = processor(text=[text], images=[[image]], return_tensors="pt", padding=True)
+    inputs = processor(
+        images=[image],
+        return_tensors="pt",
+        do_rescale=True,
+        size={"height": 448, "width": 448},
+    )
     pixel_values = inputs["pixel_values"].to(device)
-    image_grid_thw = inputs["image_grid_thw"].to(device)
+    image_grid_thw = inputs.get("image_grid_thw")
+    if image_grid_thw is not None:
+        image_grid_thw = image_grid_thw.to(device)
+    else:
+        B, _, H, W = pixel_values.shape
+        patch = 14
+        image_grid_thw = torch.tensor([[B, H // patch, W // patch]], device=device)
 
     with torch.inference_mode():
         grid_dict = visual_tap(pixel_values, image_grid_thw)
         grid_dict = {k: v.float().to(device) for k, v in grid_dict.items()}
-        logits, heatmap_logits = head(grid_dict)
-        prob = torch.sigmoid(logits)[0].item()
+        cls_logits, heatmap_logits = head(grid_dict)
+        prob = torch.sigmoid(cls_logits).detach().to(torch.float32).cpu().item()
         if heatmap_logits.dim() == 3:
             heatmap_logits = heatmap_logits.unsqueeze(1)
         heatmap_prob = torch.sigmoid(heatmap_logits)
