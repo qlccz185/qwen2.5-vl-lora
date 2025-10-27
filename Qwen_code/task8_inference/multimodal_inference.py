@@ -323,6 +323,7 @@ def run_forensic_head(
     device: torch.device,
 ) -> Tuple[float, torch.Tensor]:
     inputs = processor(
+        text=[""],
         images=[image],
         return_tensors="pt",
         do_rescale=True,
@@ -336,7 +337,7 @@ def run_forensic_head(
         B, _, H, W = pixel_values.shape
         patch = 14
         image_grid_thw = torch.tensor(
-            [[B, H // patch, W // patch]], device=device, dtype=torch.int32
+            [[B, H // patch, W // patch]], device=device, dtype=torch.int64
         )
 
     with torch.no_grad():
