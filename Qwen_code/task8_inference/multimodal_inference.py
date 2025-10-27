@@ -315,37 +315,78 @@ def iter_samples(samples: List[Dict[str, Any]], limit: Optional[int] = None) -> 
         yield index, samples[index]
 
 
+def resize_square_pad_rgb(image: Image.Image, size: int = 448, pad_color: Tuple[int, int, int] = (128, 128, 128)) -> Image.Image:
+    """Replicate the Task7 evaluation resize+pad pipeline for RGB images."""
+
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+
+    width, height = image.size
+    scale = size / max(width, height)
+    new_w = int(round(width * scale))
+    new_h = int(round(height * scale))
+    resized = image.resize((new_w, new_h), Image.BICUBIC)
+
+    canvas = Image.new("RGB", (size, size), pad_color)
+    offset_x = (size - new_w) // 2
+    offset_y = (size - new_h) // 2
+    canvas.paste(resized, (offset_x, offset_y))
+    return canvas
+
+
+def prepare_forensic_head_inputs(
+    image: Image.Image,
+    processor: AutoProcessor,
+    prompt_text: str = ".",
+) -> Dict[str, torch.Tensor]:
+    """Build processor inputs exactly as done during Task7 head evaluation."""
+
+    processed_image = resize_square_pad_rgb(image, size=448)
+    normalized_prompt = prompt_text if isinstance(prompt_text, str) and prompt_text else "."
+    message = {
+        "role": "user",
+        "content": [
+            {"type": "image", "image": processed_image},
+            {"type": "text", "text": normalized_prompt},
+        ],
+    }
+
+    chat_text = processor.apply_chat_template([message], tokenize=False, add_generation_prompt=True)
+    inputs = processor(text=[chat_text], images=[processed_image], return_tensors="pt", padding=True)
+    return inputs
+
+
 def run_forensic_head(
     image: Image.Image,
     processor: AutoProcessor,
     visual_tap: QwenVisualTap,
     head: ForensicHead,
     device: torch.device,
+    prompt_text: str = ".",
 ) -> Tuple[float, torch.Tensor]:
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image},
-                {"type": "text", "text": "."},
-            ],
-        }
-    ]
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-    inputs = processor(text=[text], images=[[image]], return_tensors="pt", padding=True)
+    inputs = prepare_forensic_head_inputs(image, processor, prompt_text)
     pixel_values = inputs["pixel_values"].to(device)
-    image_grid_thw = inputs["image_grid_thw"].to(device)
+    image_grid_thw = inputs.get("image_grid_thw")
+    if image_grid_thw is not None:
+        image_grid_thw = image_grid_thw.to(device)
+    else:
+        batch, _, height, width = pixel_values.shape
+        patch = 14  # default Qwen2.5-VL patch size
+        image_grid_thw = torch.tensor(
+            [[batch, height // patch, width // patch]], device=device, dtype=torch.int64
+        )
 
-    with torch.inference_mode():
+    with torch.no_grad():
         grid_dict = visual_tap(pixel_values, image_grid_thw)
         grid_dict = {k: v.float().to(device) for k, v in grid_dict.items()}
-        logits, heatmap_logits = head(grid_dict)
-        prob = torch.sigmoid(logits)[0].item()
+        cls_logits, heatmap_logits = head(grid_dict)
+        prob_tensor = torch.sigmoid(cls_logits).detach().to(device="cpu", dtype=torch.float32)
+        prob = prob_tensor.item()
         if heatmap_logits.dim() == 3:
             heatmap_logits = heatmap_logits.unsqueeze(1)
-        heatmap_prob = torch.sigmoid(heatmap_logits)
+        heatmap_prob = torch.sigmoid(heatmap_logits).detach().cpu()
 
-    heatmap_prob = heatmap_prob.detach().cpu()[0, 0]
+    heatmap_prob = heatmap_prob[0, 0]
     return prob, heatmap_prob
 
 
@@ -536,6 +577,12 @@ def main() -> None:
     chat_system_prompt = cfg.get("chat_system_prompt", DEFAULT_CHAT_SYSTEM_PROMPT)
     user_prompt_cfg = cfg.get("user_prompt")
 
+    head_prompt_text = cfg.get("vit_prompt")
+    if not isinstance(head_prompt_text, str) or not head_prompt_text.strip():
+        head_prompt_text = cfg.get("prompt")
+    if not isinstance(head_prompt_text, str) or not head_prompt_text.strip():
+        head_prompt_text = "."
+
     heatmap_cfg = cfg.get("heatmap", {})
     generation_cfg = cfg.get("generation", {})
 
@@ -558,7 +605,14 @@ def main() -> None:
 
         for index, sample in iter_samples(samples, limit=args.limit):
             image = Image.open(sample["image_path"]).convert("RGB")
-            prob, heatmap = run_forensic_head(image, processor, visual_tap, head, device)
+            prob, heatmap = run_forensic_head(
+                image,
+                processor,
+                visual_tap,
+                head,
+                device,
+                prompt_text=head_prompt_text,
+            )
             heatmap_np = upscale_heatmap(heatmap, image.size[::-1])
             evidence_image = create_evidence_image(image, heatmap_np, heatmap_cfg)
 
