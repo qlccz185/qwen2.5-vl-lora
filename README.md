@@ -37,7 +37,7 @@ It covers visual-backbone LoRA insertion, intermediate-feature-based forensic he
 
    ```text
    /root/autodl-tmp/
-   ├── Qwen2.5-VL-7B-Instruct/        # Official base model
+   ├── Qwen2.5-VL-7B-Instruct/        # Official base model (https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct)
    ├── qwen2.5-vl-lora/               # This repository (recommended to git clone here)
    ├── data/
    │   ├── trainingset2/
