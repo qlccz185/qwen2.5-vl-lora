@@ -28,6 +28,11 @@ def resize_square_pad(img: Image.Image, size=448, pad_color=(128,128,128)):
     canvas.paste(img, ((size-nw)//2, (size-nh)//2))
     return canvas
 
+def _logit(p, eps=1e-6):
+    p = float(np.clip(p, eps, 1 - eps))
+    return math.log(p / (1 - p))
+
+
 def build_warmup_cosine(total_steps, warmup_ratio=0.05, min_lr_scale=0.1):
     warmup_steps = int(total_steps * warmup_ratio)
     def lr_lambda(step):
@@ -264,6 +269,7 @@ class QwenVisualTap(nn.Module):
 #visual_tap = QwenVisualTap(qwen.visual, layers=(15,23,31)).to(device)
 
 # ===== 头结构（与 LoRA 期一致：MiniFuse(3路)+ClsHead+EvidenceHead64）=====
+# ========== Shared Components ==========
 class GeM(nn.Module):
     def __init__(self, p=3.0, eps=1e-6):
         super().__init__()
@@ -272,58 +278,59 @@ class GeM(nn.Module):
     def forward(self, x):
         x = x.clamp(min=self.eps).pow(self.p)
         x = F.adaptive_avg_pool2d(x, 1)
-        return x.pow(1.0/self.p).flatten(1)
+        return x.pow(1.0 / self.p).flatten(1)
 
 class MiniFuse(nn.Module):
-    """对 (15,23,31) 三层 grid 做 1x1 对齐 → 深度卷积 → 1x1 压到 out"""
     def __init__(self, in_ch=1280, layers=3, mid=512, out=512):
         super().__init__()
         self.proj = nn.ModuleList([nn.Conv2d(in_ch, mid, 1) for _ in range(layers)])
-        self.dw   = nn.Conv2d(mid*layers, mid*layers, 3, padding=1, groups=mid*layers)
-        self.pw   = nn.Conv2d(mid*layers, out, 1)
+        self.dw   = nn.Conv2d(mid * layers, mid * layers, 3, padding=1, groups=mid * layers)
+        self.pw   = nn.Conv2d(mid * layers, out, 1)
     def forward(self, grids):
         zs = [p(g) for p, g in zip(self.proj, grids)]
         z  = torch.cat(zs, dim=1)
         z  = self.dw(z)
-        z  = self.pw(z)
-        return z
+        return self.pw(z)
 
 class ClsHead(nn.Module):
-    def __init__(self, in_ch, hidden=256, use_l2norm=True):
+    """完全与 Stage 2.1 一致"""
+    def __init__(self, in_ch, hidden=256, use_l2norm=True, dropout=0.0):
         super().__init__()
         self.pool   = GeM()
         self.use_l2 = use_l2norm
         self.fc1    = nn.Linear(in_ch, hidden)
+        self.drop   = nn.Dropout(p=dropout) if dropout and dropout > 0 else nn.Identity()
         self.fc2    = nn.Linear(hidden, 1)
     def forward(self, feat_map):
         x = self.pool(feat_map)
         if self.use_l2:
             x = F.normalize(x, p=2, dim=1)
-        x = F.relu(self.fc1(x), inplace=True)
+        x = F.relu(self.fc1(x))
+        x = self.drop(x)
         return self.fc2(x)[:, 0]
 
 class EvidenceHead64(nn.Module):
-    """输入: [B,C,H,W]（通常 H=W=32），输出: coarse32 & fine64 logits"""
     def __init__(self, in_ch=512):
         super().__init__()
         self.enc = nn.Sequential(
             nn.Conv2d(in_ch, 256, 3, padding=1), nn.GELU(),
-            nn.Conv2d(256, 128, 3, padding=1),   nn.GELU(),
+            nn.Conv2d(256, 128, 3, padding=1), nn.GELU(),
         )
         self.up  = nn.Sequential(
             nn.Conv2d(128, 128*4, 3, padding=1),
-            nn.PixelShuffle(2),                   # 32->64
+            nn.PixelShuffle(2),
             nn.Conv2d(128, 64, 3, padding=1), nn.GELU(),
         )
-        self.out32 = nn.Conv2d(128, 1, 1)  # 32×32 logits
-        self.out64 = nn.Conv2d(64,  1, 1)  # 64×64 logits
+        self.out32 = nn.Conv2d(128, 1, 1)
+        self.out64 = nn.Conv2d(64,  1, 1)
     def forward(self, fmap):
-        h  = self.enc(fmap)                 # [B,128,32,32]
-        c32 = self.out32(h).squeeze(1)      # [B,32,32]
-        u  = self.up(h)                     # [B,64,64]
-        f64 = self.out64(u).squeeze(1)      # [B,64,64]
+        h  = self.enc(fmap)
+        c32 = self.out32(h).squeeze(1)
+        u  = self.up(h)
+        f64 = self.out64(u).squeeze(1)
         return c32, f64
 
+# ========== Joint Model ==========
 class ForensicJoint(nn.Module):
     def __init__(self, fuse_in_ch=1280, fuse_out_ch=512, layers=(15,23,31)):
         super().__init__()
@@ -331,15 +338,16 @@ class ForensicJoint(nn.Module):
         self.fuser  = MiniFuse(in_ch=fuse_in_ch, layers=len(self.layers), mid=512, out=fuse_out_ch)
         self.cls    = ClsHead(fuse_out_ch, hidden=256, use_l2norm=True)
         self.evi    = EvidenceHead64(in_ch=fuse_out_ch)
-    def forward(self, grid_dict):
+
+    def forward(self, grid_dict, detach_evi=False):
         grids = [grid_dict[i] for i in self.layers]
         fused = self.fuser(grids)
         logits = self.cls(fused)
-        hm32, hm64 = self.evi(fused)
+        if detach_evi:
+            hm32, hm64 = self.evi(fused.detach())
+        else:
+            hm32, hm64 = self.evi(fused)
         return logits, (hm32, hm64)
-
-def _logit(p, eps=1e-6):
-    p = float(np.clip(p, eps, 1-eps)); return math.log(p/(1-p))
 
 @torch.no_grad()
 def init_joint_heads_with_priors(heads, p1_prior=0.5, pix_prior=0.03):
@@ -383,7 +391,7 @@ def _unpack_heatmap(hm_out):
     if hm64.dim() == 3:          # [B,H,W]
         hm64 = hm64.unsqueeze(1) # -> [B,1,H,W]
     elif hm64.dim() == 4:
-        if hm64.size(1) != 1:    # 容错：如果通道不是1，就拿第1通道
+        if hm64.size(1) != 1:    
             hm64 = hm64[:, :1, ...]
     else:
         raise RuntimeError(f"Unexpected heatmap shape: {tuple(hm64.shape)}")
@@ -393,11 +401,34 @@ def _unpack_heatmap(hm_out):
 
 def train_one_epoch_joint(model, visual_tap, loader, optimizer, device,
                           grad_accum=1, scheduler=None, log_interval=50,
-                          evi_alpha=0.85, λ_e=1.2, use_focal=True, λ_sparse=5e-4, λ_contrast=5e-3):
+                          evi_alpha=0.7, λ_e=0.5, use_focal=True, λ_sparse=5e-4, λ_contrast=5e-3, diagnose_grad=False):
     model.train()
     bce_cls = nn.BCEWithLogitsLoss()
     optimizer.zero_grad(set_to_none=True)
     total, n = 0.0, 0
+    def compute_grad_cosine(model, loss_cls, loss_evi):
+        model.zero_grad(set_to_none=True)
+    
+        # 分类梯度
+        loss_cls.backward(retain_graph=True)
+        grad_cls = []
+        for p in model.fuser.parameters():
+            if p.grad is not None:
+                grad_cls.append(p.grad.detach().flatten())
+        grad_cls = torch.cat(grad_cls)
+        model.zero_grad(set_to_none=True)
+    
+        # 证据梯度
+        loss_evi.backward(retain_graph=True)
+        grad_evi = []
+        for p in model.fuser.parameters():
+            if p.grad is not None:
+                grad_evi.append(p.grad.detach().flatten())
+        grad_evi = torch.cat(grad_evi)
+    
+        cosine = torch.dot(grad_cls, grad_evi) / (grad_cls.norm() * grad_evi.norm() + 1e-8)
+        model.zero_grad(set_to_none=True)
+        return cosine.item()
 
     for step, (inputs, labels, masks, _) in enumerate(loader, 1):
         inputs = {k: v.to(device) for k,v in inputs.items()}
@@ -451,6 +482,17 @@ def train_one_epoch_joint(model, visual_tap, loader, optimizer, device,
             L_contrast = torch.zeros((), device=device)
 
         loss = L_cls + λ_e*L_evi + λ_sparse*L_sparse + λ_contrast*L_contrast
+        if diagnose_grad:
+            cosine = compute_grad_cosine(model, L_cls, L_evi)
+            print(f"[DEBUG] Grad cosine (cls vs evi): {cosine:.3f}")
+            # 不更新权重，只观测方向
+            optimizer.zero_grad(set_to_none=True)
+            continue
+        # ====== 梯度夹角分析 ======
+        if step % 50 == 0:  # 每50步打印一次
+            cosine = compute_grad_cosine(model, L_cls, L_evi)
+            print(f"[DEBUG] Gradient cosine (cls vs evi): {cosine:.3f}")
+        # ========================
         (loss / grad_accum).backward()
 
         if step % grad_accum == 0:
@@ -472,6 +514,130 @@ def train_one_epoch_joint(model, visual_tap, loader, optimizer, device,
             print(f"  step {step:5d} | loss {total/max(1,n):.4f}")
 
     return total / max(1,n)
+
+def schedule_joint_weights(epoch, total_epochs):
+    """
+    动态调度 λₑ（证据损失权重）和 evi_alpha（BCE:Dice 比例）
+    按阶段递增强化联合训练。
+    """
+    if epoch <= total_epochs * 0.2:       # 前 20% epoch：分类主导
+        λ_e = 0.4
+        evi_alpha = 0.8
+    elif epoch <= total_epochs * 0.5:     # 中期平衡
+        λ_e = 0.6
+        evi_alpha = 0.75
+    elif epoch <= total_epochs * 0.8:     # 后期强化证据
+        λ_e = 0.7
+        evi_alpha = 0.7
+    else:                                 # 收尾：微调阶段
+        λ_e = 0.5
+        evi_alpha = 0.8
+    return λ_e, evi_alpha
+
+
+import os, csv
+
+def train_joint_v2(model, visual_tap, dl_train, dl_val, optimizer, scheduler,
+                   device, total_epochs=20, grad_accum=8, log_interval=100,
+                   out_dir="outputs_lora_joint", csv_name="train_history_joint.csv",
+                   early_stop_patience=3):
+    """
+    主训练循环：动态调整 λₑ / evi_alpha，自动保存最佳 AUROC / IoU，按 epoch 追加写入 CSV，
+    并启用早停（AUROC 与 IoU 都无提升计 1 次，连续 early_stop_patience 次则停止）。
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    csv_path = os.path.join(out_dir, csv_name)
+
+    # 若 CSV 不存在，先写表头
+    if not os.path.exists(csv_path):
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                "epoch", "lambda_e", "evi_alpha", "train_loss",
+                "val_auroc", "val_acc_best", "val_f1_best",
+                "val_thr_acc", "val_thr_f1",
+                "val_iou", "val_dice",
+                "lr"
+            ])
+            writer.writeheader()
+
+    best_auc, best_iou = -1.0, -1.0
+    best_auc_ep, best_iou_ep = -1, -1
+    no_improve_counter = 0
+    history = []
+
+    for epoch in range(1, total_epochs + 1):
+        # 动态权重调度（你已有的函数）
+        λ_e, evi_alpha = schedule_joint_weights(epoch, total_epochs)
+        print(f"\nEpoch {epoch}/{total_epochs} | λₑ={λ_e:.2f} | evi_alpha={evi_alpha:.2f} | lr={optimizer.param_groups[0]['lr']:.2e}")
+
+        # === Train ===
+        train_loss = train_one_epoch_joint(
+            model, visual_tap, dl_train, optimizer, device,
+            grad_accum=grad_accum, scheduler=scheduler,
+            evi_alpha=evi_alpha, λ_e=λ_e,
+            λ_sparse=1e-4, λ_contrast=5e-3
+        )
+
+        # === Validation ===
+        m_cls = evaluate(model, visual_tap, dl_val, device)
+        m_evi = evaluate_evidence_iou(model, visual_tap, dl_val, device)
+
+        print(f"Epoch {epoch}: AUROC={m_cls['auroc']:.4f} | "
+              f"ACC@best={m_cls['acc']:.4f}@thr={m_cls['thr_acc']:.2f} | "
+              f"F1@best={m_cls['f1']:.4f}@thr={m_cls['thr_f1']:.2f} | "
+              f"IoU={m_evi['mean_iou']:.4f} | Dice={m_evi['mean_dice']:.4f}")
+
+        # === 保存到 history（内存） ===
+        row = {
+            "epoch": int(epoch),
+            "lambda_e": float(λ_e),
+            "evi_alpha": float(evi_alpha),
+            "train_loss": float(train_loss),
+            "val_auroc": float(m_cls["auroc"]),
+            "val_acc_best": float(m_cls["acc"]),
+            "val_f1_best": float(m_cls["f1"]),
+            "val_thr_acc": float(m_cls["thr_acc"]),
+            "val_thr_f1": float(m_cls["thr_f1"]),
+            "val_iou": float(m_evi["mean_iou"]),
+            "val_dice": float(m_evi["mean_dice"]),
+            "lr": float(optimizer.param_groups[0]['lr']),
+        }
+        history.append(row)
+
+        # === 追加写入 CSV（每个 epoch 写一次） ===
+        with open(csv_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+            writer.writerow(row)
+
+        # === 保存最佳模型 ===
+        improved = False
+        if m_cls["auroc"] > best_auc + 1e-6:
+            best_auc = m_cls["auroc"]; best_auc_ep = epoch
+            torch.save(model.state_dict(), os.path.join(out_dir, "best_joint_by_AUROC.pt"))
+            print(f"✔ Saved new best AUROC={best_auc:.4f} @epoch {best_auc_ep}")
+            improved = True
+
+        if m_evi["mean_iou"] > best_iou + 1e-6:
+            best_iou = m_evi["mean_iou"]; best_iou_ep = epoch
+            torch.save(model.state_dict(), os.path.join(out_dir, "best_joint_by_IoU.pt"))
+            print(f"✔ Saved new best IoU={best_iou:.4f} @epoch {best_iou_ep}")
+            improved = True
+
+        # === 早停逻辑：两个指标都没提升才 +1 ===
+        if not improved:
+            no_improve_counter += 1
+            print(f"[EarlyStop] No improvement this epoch. Patience {no_improve_counter}/{early_stop_patience}")
+            if no_improve_counter >= early_stop_patience:
+                print(f"\n⏹ Early stopped at epoch {epoch}. "
+                      f"Best AUROC={best_auc:.4f} @epoch {best_auc_ep}, "
+                      f"Best IoU={best_iou:.4f} @epoch {best_iou_ep}")
+                break
+        else:
+            no_improve_counter = 0
+
+    print(f"\n🏁 Training done. Best AUROC={best_auc:.4f} @epoch {best_auc_ep}, Best IoU={best_iou:.4f} @epoch {best_iou_ep}")
+    return history
+
 
 @torch.no_grad()
 def evaluate(model, visual_tap, data_loader, device):
@@ -576,7 +742,7 @@ def main():
     ap.add_argument("--epochs", type=int, default=25)
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--grad_accum", type=int, default=8)
-    ap.add_argument("--base_lr", type=float, default=5e-4)
+    ap.add_argument("--base_lr", type=float, default=3e-4)
     ap.add_argument("--weight_decay", type=float, default=3e-4)
     ap.add_argument("--warmup_ratio", type=float, default=0.06)
     ap.add_argument("--min_lr_scale", type=float, default=0.1)
@@ -585,8 +751,10 @@ def main():
     ap.add_argument("--evi_alpha",  type=float, default=0.5, help="BCE:Dice mixing for evidence loss")
     ap.add_argument("--no_focal",   action="store_true")
     ap.add_argument("--sparse_w",   type=float, default=1e-4)
-    ap.add_argument("--contrast_w", type=float, default=1e-2)
+    ap.add_argument("--contrast_w", type=float, default=5e-3)
     # 评估/可视化
+    ap.add_argument("--diagnose_grad", action="store_true", help="Enable gradient conflict diagnosis mode")
+    
     ap.add_argument("--eval_vis",   type=int, default=16)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
@@ -606,7 +774,6 @@ def main():
     ds_train = ForgeryJointDataset(args.train_ann, data_root=args.data_root)
     ds_val   = ForgeryJointDataset(args.val_ann,   data_root=args.data_root)
     print(f"Train: {len(ds_train)} | Val: {len(ds_val)}")
-    assert len(ds_train) > 0 and len(ds_val) > 0, 
     
     # 快速自检
     for k in [0, len(ds_train)//2, len(ds_train)-1]:
@@ -688,105 +855,14 @@ def main():
         optimizer, build_warmup_cosine(total_steps, warmup_ratio=args.warmup_ratio, min_lr_scale=args.min_lr_scale)
     )
     
-    for epoch in range(1, args.epochs+1):
-        print(f"\nEpoch {epoch}/{args.epochs} | lr={optimizer.param_groups[0]['lr']:.2e}")
-    
-        train_loss = train_one_epoch_joint(
-            heads, visual_tap, dl_train, optimizer, device,
-            grad_accum=args.grad_accum, scheduler=scheduler,
-            evi_alpha=args.evi_alpha,
-            λ_e=args.evi_weight,            
-            λ_sparse=args.sparse_w,
-            λ_contrast=args.contrast_w
-        )
-    
-        m_cls = evaluate(heads, visual_tap, dl_val, device)
-        m_evi = evaluate_evidence_iou(heads, visual_tap, dl_val, device, thr=0.3, only_fake=True)
-    
-        print(f"Epoch {epoch}: AUROC={m_cls['auroc']:.4f} | "
-              f"ACC@best={m_cls['acc']:.4f}@thr={m_cls['thr_acc']:.2f} | "
-              f"F1@best={m_cls['f1']:.4f}@thr={m_cls['thr_f1']:.2f} | "
-              f"IoU={m_evi['mean_iou']:.4f} | Dice={m_evi['mean_dice']:.4f}")
-    
-        history.append({
-            "epoch": int(epoch),
-            "train_loss": float(train_loss),
-            "val_auroc": float(m_cls["auroc"]),
-            "val_acc@0.5": float(m_cls["acc"]),
-            "val_f1@0.5": float(m_cls["f1"]),
-            "val_iou": float(m_evi["mean_iou"]),
-            "val_dice": float(m_evi["mean_dice"]),
-            "lr": float(optimizer.param_groups[0]['lr']),
-        })
-    
-        # —— 保存最佳（按 AUROC）——
-        if m_cls["auroc"] > best_auc + 1e-6:
-            best_auc = m_cls["auroc"]; best_auc_ep = epoch
-            torch.save({
-                "epoch": epoch,
-                "state_dict": heads.state_dict(),
-                "metric": {
-                    "auroc": m_cls["auroc"],
-                    "acc":   m_cls["acc"],
-                    "f1":    m_cls["f1"],
-                    "iou":   m_evi["mean_iou"],
-                    "dice":  m_evi["mean_dice"],
-                },
-                "args": vars(args)
-            }, os.path.join(args.out_dir, "best_by_AUROC_joint.pt"))
-            print(f"✔ Saved best_by_AUROC_joint.pt (AUROC={best_auc:.4f})")
-    
-        # —— 保存最佳（按 IoU）——
-        curr_iou = float(m_evi["mean_iou"])
-        if m_cls["auroc"] > best_auc + 1e-6:
-            best_auc = m_cls["auroc"]; best_auc_ep = epoch
-            torch.save({
-                "epoch": epoch,
-                "state_dict": heads.state_dict(),
-                "metric": {
-                    "auroc": m_cls["auroc"],
-                    "acc":   m_cls["acc"],
-                    "f1":    m_cls["f1"],
-                    "iou":   m_evi["mean_iou"],
-                    "dice":  m_evi["mean_dice"],
-                },
-                "args": vars(args)
-            }, os.path.join(args.out_dir, "best_by_AUROC_joint.pt"))
-            print(f"✔ Saved best_by_AUROC_joint.pt (AUROC={best_auc:.4f})")
-        
-        # 保存最佳（按 IoU）
-        curr_iou = float(m_evi["mean_iou"])
-        if curr_iou > best_iou + 1e-6:
-            best_iou = curr_iou; best_iou_ep = epoch
-            torch.save({
-                "epoch": epoch,
-                "state_dict": heads.state_dict(),
-                "metric": {
-                    "auroc": m_cls["auroc"],
-                    "acc":   m_cls["acc"],
-                    "f1":    m_cls["f1"],
-                    "iou":   m_evi["mean_iou"],
-                    "dice":  m_evi["mean_dice"],
-                },
-                "args": vars(args)
-            }, os.path.join(args.out_dir, "best_by_IoU_joint.pt"))
-            print(f"✔ Saved best_by_IoU_joint.pt (IoU={best_iou:.4f})")
-        # 最近 checkpoint
-        torch.save({
-            "epoch": epoch,
-            "state_dict": heads.state_dict(),
-            "metric": {
-                "auroc": m_cls["auroc"],
-                "acc":   m_cls["acc"],
-                "f1":    m_cls["f1"],
-                "iou":   m_evi["mean_iou"],
-                "dice":  m_evi["mean_dice"],
-            },
-            "args": vars(args)
-        }, os.path.join(args.out_dir, f"last_epoch_{epoch:03d}.pt"))
-        
-        print(f"\nDone. Best Val AUROC (joint) = {best_auc:.4f}")
-        print(f"[BEST] AUROC={best_auc:.4f} @epoch {best_auc_ep} | IoU={best_iou:.4f} @epoch {best_iou_ep}")
+    history = train_joint_v2(
+        heads, visual_tap, dl_train, dl_val, optimizer, scheduler,
+        device, total_epochs=args.epochs,
+        grad_accum=args.grad_accum, log_interval=50,
+        out_dir=args.out_dir,                     # ✅ 保存模型与CSV到这个目录
+        csv_name="train_history_joint.csv",       # ✅ CSV 文件名
+        early_stop_patience=3                     # ✅ 连续3个epoch无提升则早停
+    )
 
 if __name__ == "__main__":
     main()
