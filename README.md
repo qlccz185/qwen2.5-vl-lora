@@ -4,7 +4,7 @@
   <img src="modelimages/logo.png" alt="logo" width="30%" />
 </p>
 
-This repository organizes a complete **multi-stage LoRA training, evaluation, and inference pipeline** built around **Qwen2.5-VL-7B-Instruct**.  
+This repository is provided by Yuhui Zhang and Han Wu. It organizes a complete **multi-stage LoRA training, evaluation, and inference pipeline built around Qwen2.5-VL-7B-Instruct**.
 It covers visual-backbone LoRA insertion, intermediate-feature-based forensic head training, heatmap generation, and multimodal reasoning that integrates visual evidence into textual outputs.
 
 ![Data and Output Overview](image.png)
@@ -78,50 +78,70 @@ Training and evaluation scripts read JSON lists where each entry contains the im
 
 ## 🧠 Training Pipeline
 
-### 🚀 Stage A – Classification-Head Warm-Up  
-`Qwen_pretrain/script/warmclassification.py`
+The core principle of this four-stage fine-tuning pipeline is to first use LoRA to reshape the visual feature space, and then fit the classification and evidence heads within the new feature space.
 
-- Freeze the Qwen2.5-VL visual and language towers; train only the fusion neck and binary classification head.  
+### 🚀 Stage A –  LoRA Warm-Up
+`Qwen_pretrain/script/stage1_lora_cls`
+
+- Inject LoRA into selected visual attention layers and freeze the ViT + LM.  
 - Reads data from `/root/data/trainingset2/trainingset2/annotation.json` (modifiable).  
 - Key arguments: `--epochs`, `--batch_size`, `--lr`, `--val_ratio`.  
-- Output directory (default `outputs_clsA/`) saves `best_val_auc.pt` and training logs.  
-- The best classification head is used as initialization for the next stages.
+- Output directory (default `outputs_clsA/`) saves lora adapter and training logs.  
+- The best classification lora adapter is used as initialization for the next stages.
 
 **Example:**
 ```bash
-python Qwen_pretrain/script/warmclassification.py   --epochs 4 --batch_size 32 --out_dir /root/autodl-tmp/taskA_cls
+python Qwen_pretrain/script/stage1_lora_cls   --epochs 4 --batch_size 32 --out_dir /root/autodl-tmp/taskA_cls
 ```
 
 ---
 
-### 🔥 Stage B – Joint Classification + Heatmap Training  
-`Qwen_pretrain/script/classanddetect.py`
+### 🔥 Stage B – LoRA Joint Fine-Tuning
+`Qwen_pretrain/script/stage2_lora_joint`
 
-- Freeze the visual backbone; jointly optimize classification and heatmap branches.  
+- Unfreeze LoRA while keeping ViT frozen. Jointly train classification and evidence heads so LoRA captures multi-task visual features.  
 - Requires outputs from Stage A (`best_by_AUROC.pt`, `calibration.json`).  
 - Specify data via `--data_root`, `--train_ann`, `--val_ann`.  
 - Evaluation logs include classification metrics (AUROC/ACC/F1) and mask metrics (IoU/Dice).  
-- Output directory (default `outputs_joint/`) contains `best_by_AUROC_joint.pt` and heatmap snapshots.
+- Output directory (default `outputs_joint/`) saves lora adapter and training logs. 
 
 **Example:**
 ```bash
-python Qwen_pretrain/script/classanddetect.py   --data_root /root/autodl-tmp/data   --train_ann /root/autodl-tmp/data/trainingset2/train_idx.json   --val_ann /root/autodl-tmp/data/trainingset2/val_idx.json   --clsA_dir /root/autodl-tmp/taskA_cls   --out_dir /root/autodl-tmp/taskB_joint
+python Qwen_pretrain/script/stage2_lora_joint  --data_root /root/autodl-tmp/data   --train_ann /root/autodl-tmp/data/trainingset2/train_idx.json   --val_ann /root/autodl-tmp/data/trainingset2/val_idx.json   --clsA_dir /root/autodl-tmp/taskA_cls   --out_dir /root/autodl-tmp/taskB_joint
 ```
 
 ---
 
-### ⚡ Stage C – Visual LoRA Joint Fine-Tuning  
-`Qwen_pretrain/script/afterloradandc.py`
+### ⚡ Stage C – Classification Head Re-Fitting
+`Qwen_pretrain/script/stage1_cls`
 
-- Load LoRA adapters into the visual tower and continue joint training of classification + heatmap heads.  
+- Freeze ViT and LoRA, retrain a new classification head in the LoRA-enhanced space for stability and adaptation.
 - LoRA layers (default `[15, 23, 31]`) are injected via `peft`.  
-- Similar arguments as Stage B, with additional losses (`--evi_alpha`, `--sparse_w`, `--contrast_w`).  
-- Output (default `outputs_lora_joint/`) contains `best_by_AUROC_joint.pt`, `best_by_IoU_joint.pt`, checkpoints and logs.
+- Output contains `best_by_AUROC_joint.pt` checkpoints and logs.
+
 
 **Example:**
 ```bash
-python Qwen_pretrain/script/afterloradandc.py   --data_root /root/autodl-tmp/data   --train_ann /root/autodl-tmp/data/trainingset2/train_idx.json   --val_ann /root/autodl-tmp/data/trainingset2/val_idx.json   --model_path /root/autodl-tmp/Qwen2.5-VL-7B-Instruct   --clsA_dir /root/autodl-tmp/taskB_joint   --out_dir /root/autodl-tmp/taskC_lora
+python Qwen_pretrain/script/stage1_cls   --data_root /root/autodl-tmp/data   --train_ann /root/autodl-tmp/data/trainingset2/train_idx.json   --val_ann /root/autodl-tmp/data/trainingset2/val_idx.json   --model_path /root/autodl-tmp/Qwen2.5-VL-7B-Instruct   --clsA_dir /root/autodl-tmp/taskB_joint   --out_dir /root/autodl-tmp/taskC_lora
 ```
+
+---
+
+### 🔥 Stage D – Final Joint Optimization 
+`Qwen_pretrain/script/stage2_joint`
+
+- Freeze ViT and LoRA, jointly fine-tune classification + evidence heads with adaptive λₑ to balance gradients.  
+- Similar arguments as Stage B, with additional losses (`--evi_alpha`, `--sparse_w`, `--contrast_w`).  
+- Evaluation logs include classification metrics (AUROC/ACC/F1) and mask metrics (IoU/Dice).  
+- Phase-wise λₑ: Phase 1: 0.4, Phase 2: 0.6, Phase 3: 0.7, Final Smooth: 0.5
+- Output contains `best_by_AUROC_joint.pt`, `best_by_IoU_joint.pt`, checkpoints and logs.
+
+**Example:**
+```bash
+python Qwen_pretrain/script/stage2_joint  --data_root /root/autodl-tmp/data   --train_ann /root/autodl-tmp/data/trainingset2/train_idx.json   --val_ann /root/autodl-tmp/data/trainingset2/val_idx.json   --clsA_dir /root/autodl-tmp/taskA_cls   --out_dir /root/autodl-tmp/taskB_joint
+```
+
+---
 
 After training, organize the best weights as follows:
 - `Qwen_pretrain/lora_adapter/` – LoRA adapter (`adapter_model.safetensors`, `adapter_config.json`)  
