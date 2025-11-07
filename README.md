@@ -6,6 +6,7 @@
 
 This repository is provided by Yuhui Zhang and Han Wu. It organizes a complete **multi-stage LoRA training, evaluation, and inference pipeline built around Qwen2.5-VL-7B-Instruct**.
 It covers visual-backbone LoRA insertion, intermediate-feature-based forensic head training, heatmap generation, and multimodal reasoning that integrates visual evidence into textual outputs.
+The Output in this link: https://drive.google.com/drive/folders/1AkWA8jKgtMqnuhkp8Nrd2Llfbn0_-iAx?usp=sharing
 
 ![Data and Output Overview](image.png)
 
