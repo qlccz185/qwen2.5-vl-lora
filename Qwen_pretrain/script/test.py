@@ -12,7 +12,7 @@ from torch.utils.data import Dataset, DataLoader
 
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 
-# 基础工具
+
 def set_seed(seed=42):
     random.seed(seed); np.random.seed(seed)
     torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
