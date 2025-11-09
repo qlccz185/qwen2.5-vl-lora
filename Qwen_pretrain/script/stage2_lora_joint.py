@@ -12,7 +12,7 @@ import numpy as np
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 from peft import LoraConfig, get_peft_model, PeftModel, TaskType
 
-# Tools/components you already have (reuse according to your project structure)
+
 from classanddetect import (
     ForgeryJointDataset, collate_joint,
     ForensicJoint,                # fuser + cls + evidence heads
