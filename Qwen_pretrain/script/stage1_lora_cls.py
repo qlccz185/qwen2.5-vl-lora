@@ -115,7 +115,7 @@ class QwenVisualTap(nn.Module):
 
     def _make_hook(self, idx):
         def _hook(module, inp, out):
-            # out: [B, L_pad, C] 或 [Total_L, C]
+            # output: [B, L_pad, C] or [Total_L, C]
             self._feat_cache[idx] = out
         return _hook
 
@@ -137,7 +137,7 @@ class QwenVisualTap(nn.Module):
     def rebind(self, visual):
 
         self.visual = visual
-        self.core = getattr(visual, "base_model", visual)  # 真正执行 forward 的对象
+        self.core = getattr(visual, "base_model", visual)  # the object that actually runs forward
         self._clear_hooks()
         for i in self.layers:
             self._hooks.append(self.core.blocks[i].register_forward_hook(self._make_hook(i)))
@@ -214,7 +214,7 @@ class MiniFuse(nn.Module):
         self.dw   = nn.Conv2d(mid * layers, mid * layers, 3, padding=1, groups=mid * layers)
         self.pw   = nn.Conv2d(mid * layers, out, 1)
     def forward(self, grids):
-        # grids: List[[B,C,H,W]]，长度=layers
+        # grids: List[[B,C,H,W]], length = number of layers
         zs = [p(g) for p, g in zip(self.proj, grids)]
         z  = torch.cat(zs, dim=1)
         z  = self.dw(z)
@@ -230,7 +230,7 @@ class ClsHead(nn.Module):
     def forward(self, feat_map):  # feat_map: [B,C,H,W]
         x = self.pool(feat_map)   # [B,C]
         if self.use_l2:
-            x = F.normalize(x, p=2, dim=1)  # 轻量稳态化，抑制初期 logit 抖动
+            x = F.normalize(x, p=2, dim=1)  # light stabilization to suppress initial logit jitter
         x = F.relu(self.fc1(x))
         return self.fc2(x)[:, 0]  # [B]
 
@@ -442,26 +442,26 @@ def main():
     ap.add_argument("--patience", type=int, default=3)
     ap.add_argument("--min_delta", type=float, default=1e-4)
     
-    ap.add_argument("--freeze_epochs_head", type=int, default=3, help="头部热身的 epoch 数；热身结束后就把头冻住")
-    ap.add_argument("--lora_after_lr", type=float, default=2e-5, help="进入第二阶段后 LoRA 的有效学习率（第一阶段为0）")
+    ap.add_argument("--freeze_epochs_head", type=int, default=3, help="Number of warm-up epochs for the head; freeze the head after warm-up")
+    ap.add_argument("--lora_after_lr", type=float, default=2e-5, help="Effective LoRA learning rate after entering stage 2 (zero during stage 1)")
     ap.add_argument("--head_after_scale", type=float, default=0.015,
-                help="阶段2中Head LR相对于base_lr的缩放")
+                help="Scale factor between the head LR and base_lr in stage 2")
     ap.add_argument("--cls_loss_scale_after", type=float, default=1.3,
-                help="阶段2分类损失放大系数（增强LoRA梯度），1.0表示不放大")
+                help="Amplification factor for the classification loss in stage 2 (boosts LoRA gradients); 1.0 means no amplification")
 
-    # ======= LoRA 专属参数 =======
+    # ======= LoRA-specific parameters =======
     ap.add_argument("--lora_layers", type=str, default="15,23,31",
-                    help="LoRA 层编号，用逗号分隔，例如 '31' 或 '23,31'")
+                    help="LoRA layer indices, comma-separated, e.g., '31' or '23,31'")
     ap.add_argument("--lora_rank", type=int, default=16, help="LoRA rank r")
     ap.add_argument("--lora_alpha", type=int, default=32, help="LoRA scaling alpha")
     ap.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout")
-    # ======= 消融 =======
+    # ======= Ablations =======
     ap.add_argument("--do_ablation", action="store_true",
-                help="训练结束后立刻做 A/B 消融（RandHead+Frozen LoRA vs RandHead+No-LoRA）")
+                help="Run immediate A/B ablations after training (RandHead+Frozen LoRA vs RandHead+No-LoRA)")
     ap.add_argument("--ablate_ckpt", type=str, default="best_by_AUROC.pt",
-                    help="用哪个组合 ckpt 做消融（相对 out_dir 的路径或绝对路径）")
+                    help="Which combined checkpoint to use for the ablation (path relative to out_dir or absolute)")
     ap.add_argument("--ablate_head_epochs", type=int, default=1,
-                    help="消融时随机头微调的 epoch 数（0 表示只做 0-shot）")
+                    help="Number of epochs to fine-tune a random head during ablation (0 means 0-shot only)")
 
     args = ap.parse_args()
 
@@ -473,14 +473,14 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    # --- 数据集 ---
+    # --- Dataset ---
     train_ann = str(Path(args.split_dir) / "train_idx.json")
     val_ann   = str(Path(args.split_dir) / "val_idx.json")
     ds_train = ForgeryClsDataset(train_ann, data_root=args.data_root, invert_label=False)
     ds_val   = ForgeryClsDataset(val_ann,   data_root=args.data_root, invert_label=False)
     print(f"Train: {len(ds_train)} | Val: {len(ds_val)}")
 
-    # --- 模型/processor ---
+    # --- Model / processor ---
     processor = AutoProcessor.from_pretrained(args.model_path, local_files_only=True)
     qwen = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         args.model_path, torch_dtype=torch.bfloat16, device_map="auto", attn_implementation="flash_attention_2"
@@ -488,30 +488,30 @@ def main():
     for p in qwen.parameters(): p.requires_grad = False
     qwen.eval()
 
-    # --- 仅给视觉塔注入 LoRA（Attn-only），并只启用指定 blocks ---
+    # --- Inject LoRA only into the vision tower (attention-only) and enable the specified blocks ---
     layers = [int(x) for x in args.lora_layers.split(",") if x.strip()]
     qwen.visual = inject_visual_lora_attn_only(
         qwen.visual, layers=layers, r=args.lora_rank,
         alpha=args.lora_alpha, dropout=args.lora_dropout
     )
-    qwen.visual.train()   # LoRA 子模块需要 train；语言塔保持 eval()
+    qwen.visual.train()   # LoRA submodules need to be in train mode; keep the language tower in eval()
 
-    # sanity：统计可训练 LoRA 参数
+    # sanity check: count trainable LoRA parameters
     n_lora = sum(p.numel() for n,p in qwen.visual.named_parameters()
                  if p.requires_grad and "lora_" in n)
     print(f"[LoRA] trainable lora params: {n_lora/1e6:.3f}M on blocks={layers}")
-    assert n_lora > 0, "LoRA 未正确注入（检查匹配与层号）"
+    assert n_lora > 0, "LoRA was not injected correctly (check matches and layer indices)"
 
     # --- taps & head ---
     visual_tap = QwenVisualTap(qwen.visual, layers=(7,15,23,31)).to(device)
     head = ForensicCls(
-        fuse_in_ch=1280,    # Qwen 视觉通道
-        fuse_out_ch=512,    # 融合后通道
+        fuse_in_ch=1280,    # Qwen visual channels
+        fuse_out_ch=512,    # channels after fusion
         layers=(7,15,23,31),
         head_hidden=256
     ).to(device)
 
-    # --- 烟雾测试（小样本过拟合检查）---
+    # --- Smoke test (small-sample overfitting check) ---
     if args.smoke:
         ds_train = build_tiny_balanced_subset(ds_train, per_class=32)
         ds_val   = ds_train
@@ -527,7 +527,7 @@ def main():
                           num_workers=args.num_workers, pin_memory=True, persistent_workers=True,
                           collate_fn=collate_fn)
 
-    # ---- 优化器 / 调度（两组参数：LoRA + 头）----
+    # ---- Optimizer / schedule (two parameter groups: LoRA + head) ----
     lora_params = [p for n,p in qwen.visual.named_parameters() if p.requires_grad and "lora_" in n]
     head_params = list(head.parameters())
     
@@ -540,9 +540,9 @@ def main():
     
     steps_per_epoch = math.ceil(len(dl_train) / max(1, args.grad_accum))
     total_steps     = args.epochs * steps_per_epoch
-    steps_freeze    = args.freeze_epochs_head * steps_per_epoch  # “阶段切换”步
+    steps_freeze    = args.freeze_epochs_head * steps_per_epoch  # "stage switch" step count
     
-    # Head：阶段1用 warmup→恒1.0；阶段2改为一个很小的常数比例（不为0）
+    # Head: use warmup then stay at 1.0 in stage 1; in stage 2 switch to a small constant factor (non-zero)
     def lr_lambda_head(global_step: int):
         if global_step < steps_freeze:
             warmup = int(steps_freeze * args.warmup_ratio)
@@ -550,10 +550,10 @@ def main():
                 return global_step / max(1, warmup)
             return 1.0
         else:
-            # 阶段2：给个很小但非零的比例，保证LoRA端有可观梯度
+            # Stage 2: keep a small but non-zero factor to ensure the LoRA branch still receives gradients
             return args.head_after_scale
     
-    # LoRA：阶段1关闭，阶段2开启（恒1.0；如需可再加轻微warmup）
+    # LoRA: off during stage 1, on during stage 2 (fixed 1.0; add a mild warmup if desired)
     def lr_lambda_lora(global_step: int):
         if global_step < steps_freeze:
             return 0.0
@@ -562,13 +562,13 @@ def main():
     
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
-        lr_lambda=[lr_lambda_lora, lr_lambda_head]  # 顺序对应 param_groups
+        lr_lambda=[lr_lambda_lora, lr_lambda_head]  # order matches the param_groups
     )
     
     print(f"[SCHED] steps_per_epoch={steps_per_epoch}, total_steps={total_steps}, steps_freeze={steps_freeze}")
     print(f"[SCHED] lora_after_lr={args.lora_after_lr}, head_after_scale={args.head_after_scale}")
 
-    # ---- 输出层 bias 先验（按训练集正例率）----
+    # ---- Output-layer bias prior (based on the positive rate in the training set) ----
     pos_cnt = sum(ds_train[i]["label"] == 1 for i in range(len(ds_train)))
     p1 = max(1e-4, min(1 - 1e-4, pos_cnt / max(1, len(ds_train))))
     logit_p1 = math.log(p1 / (1 - p1))
@@ -578,7 +578,7 @@ def main():
     print(f"[INIT] set output bias with prior p1={p1:.4f}")
     bce_logits = nn.BCEWithLogitsLoss()
 
-    # ---- 训练循环 ----
+    # ---- Training loop ----
     bests = {"auroc": (-1.0, None), "acc05": (-1.0, None), "accstar": (-1.0, None), "f1star": (-1.0, None)}
     history = []
     best_metric = -float("inf")
@@ -587,10 +587,10 @@ def main():
 
     def _save_combo_ckpt(dst_path, qwen, head, metrics, epoch, args):
         """
-        统一保存三份：
-        1) 组合 ckpt（含 head_state + visual_lora）→ dst_path
-        2) 仅 head → <stem>_head_only.pt
-        3) 仅 lora → <stem>_lora_only.pt （若视觉为 PeftModel 才会导出）
+        Save three versions together:
+        1) Combined checkpoint (contains head_state + visual_lora) → dst_path
+        2) Head only → <stem>_head_only.pt
+        3) LoRA only → <stem>_lora_only.pt (exported only if the vision module is a PeftModel)
         """
         payload = {
             "epoch": epoch,
@@ -605,7 +605,7 @@ def main():
     
         out_dir = Path(dst_path).parent
         stem = Path(dst_path).stem
-        # 分别落盘 head / lora
+        # Save head / LoRA separately
         torch.save(head.state_dict(), out_dir / f"{stem}_head_only.pt")
         if isinstance(qwen.visual, PeftModel):
             torch.save(qwen.visual.state_dict(), out_dir / f"{stem}_lora_only.pt")
@@ -649,7 +649,7 @@ def main():
             "lr_head": float(lr_head),
         })
 
-        # ---- 保存 best（按不同指标）----
+        # ---- Save the best checkpoints (by different metrics) ----
         def _save_best(key, score, fname):
             nonlocal bests
             if score > bests[key][0] + 1e-12:
@@ -663,11 +663,11 @@ def main():
         _save_best("accstar", metrics["acc_star"],"best_by_ACCstar.pt")
         _save_best("f1star",  metrics["f1_opt"],  "best_by_F1star.pt")
         
-        # ---- 保存最近 checkpoint ----
+        # ---- Save the most recent checkpoint ----
         #_last_path = os.path.join(args.out_dir, f"last_epoch_{epoch:03d}.pt")
         #_save_combo_ckpt(_last_path, qwen, head, metrics, epoch, args)
 
-        # ---- Early Stopping（以 AUROC 为准）----
+        # ---- Early stopping (based on AUROC) ----
         if auroc > best_metric + args.min_delta:
             best_metric = auroc
             best_epoch  = epoch
@@ -679,7 +679,7 @@ def main():
                   f"(best AUROC={best_metric:.4f} @ epoch {best_epoch}).")
             break
 
-    # ---- 保存训练日志 ----
+    # ---- Save the training log ----
     try:
         import pandas as pd
         pd.DataFrame(history).to_csv(os.path.join(args.out_dir, "training_log.csv"), index=False)

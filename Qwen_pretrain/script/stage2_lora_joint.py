@@ -12,21 +12,21 @@ import numpy as np
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 from peft import LoraConfig, get_peft_model, PeftModel, TaskType
 
-# 你已有的工具/组件（按你的工程结构复用）
+# Tools/components you already have (reuse according to your project structure)
 from classanddetect import (
     ForgeryJointDataset, collate_joint,
-    ForensicJoint,                # fuser + cls + evi （分类头+证据头）
+    ForensicJoint,                # fuser + cls + evidence heads
     evaluate, 
     build_warmup_cosine, set_seed
 )
 
 # =========================
-# Visual Tap（hooks 绑 core）
+# Visual Tap (hooks bound to the core)
 # =========================
 class QwenVisualTap(nn.Module):
     """
-    从视觉塔指定 blocks 取特征；返回：{layer_idx: [B,C,H_max,W_max]}
-    重要：hooks 挂在 base_model（core）上，forward 也走 core
+    Extract features from specified blocks of the vision tower; returns {layer_idx: [B,C,H_max,W_max]}
+    Important: hooks attach to the base_model (core), and forward also runs through the core
     """
     def __init__(self, visual, layers=(7,15,23,31)):
         super().__init__()
@@ -37,7 +37,7 @@ class QwenVisualTap(nn.Module):
 
     def _make_hook(self, idx):
         def _hook(module, inp, out):
-            # 有些实现可能 tuple 返回
+            # some implementations may return a tuple
             if isinstance(out, (tuple, list)): out = out[0]
             self._feat_cache[idx] = out
         return _hook
@@ -50,7 +50,7 @@ class QwenVisualTap(nn.Module):
 
     def rebind(self, visual):
         self.visual = visual
-        self.core = getattr(visual, "base_model", visual)  # 真正执行 forward 的对象
+        self.core = getattr(visual, "base_model", visual)  # the object that actually runs forward
         self._clear_hooks()
         for i in self.layers:
             self._hooks.append(self.core.blocks[i].register_forward_hook(self._make_hook(i)))
@@ -63,10 +63,10 @@ class QwenVisualTap(nn.Module):
         pv  = pixel_values.to(device=dev, dtype=dtype)
         thw = thw.to(dev) if isinstance(thw, torch.Tensor) else thw
 
-        # 关键：走 core 保证 hooks 触发
+        # key point: use the core so the hooks fire
         _ = self.core(pv, thw)
 
-        # 形状还原
+        # restore the spatial shape
         thw_list = thw.tolist() if isinstance(thw, torch.Tensor) else thw
         Hs = [int(v[1]) for v in thw_list]
         Ws = [int(v[2]) for v in thw_list]
@@ -74,14 +74,14 @@ class QwenVisualTap(nn.Module):
         Hmax, Wmax = max(Hs), max(Ws)
         lengths = [h*w for h,w in zip(Hs, Ws)]
 
-        # 自检
+        # self-check
         missing = [i for i in self.layers if i not in self._feat_cache]
         if missing:
             raise RuntimeError(f"[VIS TAP] hooks not triggered for layers: {missing}.")
 
         out = {}
         for i in self.layers:
-            feat = self._feat_cache[i]              # [Total_L,C] 或 [B,L,C]
+            feat = self._feat_cache[i]              # [Total_L,C] or [B,L,C]
             if feat.dim() == 3:
                 feat = feat.reshape(-1, feat.size(-1))
             chunks = torch.split(feat, lengths, dim=0)  # N * [L_i,C]
@@ -98,7 +98,7 @@ class QwenVisualTap(nn.Module):
         return out
 
 class EvidenceHead64(nn.Module):
-    """输入: [B,C,H,W]（通常 H=W=32），输出: coarse32 & fine64 logits"""
+    """Input: [B,C,H,W] (typically H=W=32); output: coarse 32×32 and fine 64×64 logits"""
     def __init__(self, in_ch=512):
         super().__init__()
         self.enc = nn.Sequential(
@@ -106,12 +106,12 @@ class EvidenceHead64(nn.Module):
             nn.Conv2d(256, 128, 3, padding=1),   nn.GELU(),
         )
         self.up  = nn.Sequential(
-            nn.Conv2d(128, 128*4, 3, padding=1),  # 为 PixelShuffle(2) 准备 4x 通道
+            nn.Conv2d(128, 128*4, 3, padding=1),  # provide 4× channels for PixelShuffle(2)
             nn.PixelShuffle(2),                   # 32->64
             nn.Conv2d(128, 64, 3, padding=1), nn.GELU(),
         )
-        self.out32 = nn.Conv2d(128, 1, 1)  # 32×32 logits（可选 aux）
-        self.out64 = nn.Conv2d(64,  1, 1)  # 64×64 logits（主 supervision）
+        self.out32 = nn.Conv2d(128, 1, 1)  # 32×32 logits (optional auxiliary branch)
+        self.out64 = nn.Conv2d(64,  1, 1)  # 64×64 logits (main supervision)
 
     def forward(self, fmap):
         h  = self.enc(fmap)                 # [B,128,32,32]
@@ -126,23 +126,23 @@ def _logit(p, eps=1e-6):
 
 @torch.no_grad()
 def init_joint_heads_with_priors(heads, p1_prior=0.5, pix_prior=0.03):
-    # 分类头
+    # classification head
     if hasattr(heads, "cls") and hasattr(heads.cls, "fc2") and heads.cls.fc2.bias is not None:
         heads.cls.fc2.bias.fill_(_logit(p1_prior))
 
-    # 证据头
+    # evidence head
     evi = getattr(heads, "evi", None)
     if evi is not None:
-        # 先统一初始化
+        # initialize uniformly first
         for m in evi.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        # 再覆盖最终输出层 bias 先验
+        # then overwrite the final output-layer bias with the prior
         if hasattr(evi, "out64") and evi.out64.bias is not None:
             evi.out64.bias.fill_(_logit(pix_prior))
-        # 兼容旧实现
+        # keep compatibility with older implementations
         if hasattr(evi, "conv2") and evi.conv2.bias is not None:
             evi.conv2.bias.fill_(_logit(pix_prior))
 
@@ -163,12 +163,12 @@ def evaluate_evidence_iou(model, visual_tap, data_loader, device, thr=0.4, only_
         if isinstance(hm, (tuple, list)):
             _, hm64 = hm
         else:
-            hm64 = hm                         # 兼容旧返回
+            hm64 = hm                         # compatibility with the old return format
 
         prob64 = torch.sigmoid(hm64.unsqueeze(1))  # [B,1,64,64]
         if isinstance(masks, list):
             masks = torch.stack(masks, dim=0)
-        masks = masks.to(device)  # <<< 关键修复：把掩码搬到同一设备
+        masks = masks.to(device)  # <<< critical fix: move the masks onto the same device
         gt64 = F.interpolate(masks.unsqueeze(1).float(), size=prob64.shape[-2:],
                              mode="bilinear", align_corners=False).clamp(0,1)
 
@@ -202,10 +202,10 @@ def evaluate_evidence_iou(model, visual_tap, data_loader, device, thr=0.4, only_
     }
 
 # =========================
-# LoRA 注入（注意力层，仅 15/23/31）
+# LoRA injection (attention layers only, layers 15/23/31)
 # =========================
 def inject_visual_lora_attn_only(visual, layers=(15,23,31), r=16, alpha=16, dropout=0.05):
-    target = ["attn.qkv", "attn.proj"]   # 仅注意力，不打 MLP
+    target = ["attn.qkv", "attn.proj"]   # attention modules only, leave the MLP untouched
     cfg = LoraConfig(
         task_type=TaskType.FEATURE_EXTRACTION,
         r=r, lora_alpha=alpha, lora_dropout=dropout,
@@ -228,23 +228,23 @@ def inject_visual_lora_attn_only(visual, layers=(15,23,31), r=16, alpha=16, drop
 
 def load_visual_lora_state_dict(visual, ckpt_path: str):
     """
-    将 best_by_AUROC_lora_only.pt 加载到已注入LoRA的 visual（PeftModel）中。
-    该 ckpt 预计是 `qwen.visual.state_dict()`（只包含 lora_* 权重）。
+    Load best_by_AUROC_lora_only.pt into the vision module with LoRA injected (a PeftModel).
+    The checkpoint is expected to be `qwen.visual.state_dict()` (contains only lora_* weights).
     """
     sd = torch.load(ckpt_path, map_location="cpu")
-    # 兼容：如果是打包的组合ckpt，尝试取 "visual_lora"
+    # compatibility: if it is a bundled combined checkpoint, try to read "visual_lora"
     if isinstance(sd, dict) and "visual_lora" in sd and isinstance(sd["visual_lora"], dict):
         sd = sd["visual_lora"]
 
     missing, unexpected = visual.load_state_dict(sd, strict=False)
-    # 只要 missing/unexpected 都不是 lora 之外的权重即可接受
+    # acceptable as long as any missing/unexpected keys are confined to LoRA weights
     miss_lora = [k for k in missing if "lora_" in k]
     unexp_lora = [k for k in unexpected if "lora_" in k]
     print(f"[LOAD LORA] loaded={len(sd)} tensors | missing_lora={len(miss_lora)} | unexpected_lora={len(unexp_lora)}")
     return len(sd) > 0
 
 # =========================
-# 训练一个 epoch（联合）
+# Train for one epoch (joint)
 # =========================
 def train_one_epoch_joint(
     heads: nn.Module, visual_tap: nn.Module, loader: DataLoader, optimizer, device,
@@ -257,7 +257,7 @@ def train_one_epoch_joint(
     lambda_aux=0.0,
     pos_weight_cap=8.0,
     phase="B",               # "A_EVI" | "A_CLS" | "B" | "C"
-    cls_weight=1.0,          # 分段控制分类项权重；证据探针期设为0
+    cls_weight=1.0,          # piecewise control of the classification loss weight; set to 0 during the evidence-probe phase
 ):
     heads.train()
     bce_cls = nn.BCEWithLogitsLoss()
@@ -265,30 +265,30 @@ def train_one_epoch_joint(
     total, seen = 0.0, 0
 
     for step, (inputs, labels, masks, _) in enumerate(loader, 1):
-        # ---- 准备数据 ----
+        # ---- Prepare data ----
         inputs = {k: v.to(device) for k, v in inputs.items()}
         labels = labels.to(device)                     # [B]
         masks  = masks.to(device)                      # [B,H,W]
-        bs = labels.size(0)                            # <<< 先定义 bs
+        bs = labels.size(0)                            # <<< define bs first
 
-        # ---- 取多层特征 ----
+        # ---- Extract multi-layer features ----
         grids = visual_tap(inputs["pixel_values"], inputs["image_grid_thw"])  # dict: layer -> [B,C,H,W]
 
-        # ---- 前向 ----
-        logits, hm_logits = heads(grids)               # hm: (hm32, hm64) 或 单个 hm64
+        # ---- Forward ----
+        logits, hm_logits = heads(grids)               # hm: either (hm32, hm64) or a single hm64
         if isinstance(hm_logits, (tuple, list)):
             hm32, hm64 = hm_logits
         else:
-            hm32, hm64 = None, hm_logits              # 兼容旧返回
+            hm32, hm64 = None, hm_logits              # compatibility with the old return format
         if hm64.dim() == 3:
-            hm64 = hm64                                # [B,64,64]（本实现已 squeeze）
+            hm64 = hm64                                # [B,64,64] (already squeezed in this implementation)
         elif hm64.dim() == 4 and hm64.size(1) == 1:
             hm64 = hm64.squeeze(1)                     # [B,64,64]
 
-        # ---- 分类损失（联合期/分类探针用）----
+        # ---- Classification loss (used in the joint phase / classification probe) ----
         L_cls = bce_cls(logits, labels)
 
-        # ---- 证据损失（主分支：64×64）----
+        # ---- Evidence loss (main branch: 64×64) ----
         prob64 = torch.sigmoid(hm64.unsqueeze(1))      # [B,1,64,64]
         mask64 = F.interpolate(masks.unsqueeze(1).float(), size=prob64.shape[-2:],
                                mode="bilinear", align_corners=False).clamp(0,1)
@@ -301,7 +301,7 @@ def train_one_epoch_joint(
         bce_pix = nn.BCEWithLogitsLoss(pos_weight=pos_w)
         L_bce   = bce_pix(hm64.unsqueeze(1), mask64)
 
-        pos_mask = (labels.view(-1,1,1,1) > 0.5).float()  # 只在假图上算 Dice
+        pos_mask = (labels.view(-1,1,1,1) > 0.5).float()  # compute Dice only on fake images
         pp = prob64 * pos_mask
         gg = mask64 * pos_mask
         inter  = (pp * gg).sum(dim=(1,2,3))
@@ -312,7 +312,7 @@ def train_one_epoch_joint(
 
         L_evi_main = evi_alpha * L_bce + (1. - evi_alpha) * L_dice
 
-        # ---- 可选：32×32 辅助监督（默认关）----
+        # ---- Optional: 32×32 auxiliary supervision (off by default) ----
         if (lambda_aux > 0.0) and (hm32 is not None):
             if hm32.dim() == 3:
                 hm32 = hm32
@@ -326,7 +326,7 @@ def train_one_epoch_joint(
         else:
             L_aux = torch.zeros((), device=device)
 
-        # ---- 稀疏/对比 ----
+        # ---- Sparsity / contrast ----
         L_sparse = prob64.mean() * lambda_sparse
         if lambda_contrast > 0:
             real_idx = (labels < 0.5)
@@ -338,15 +338,15 @@ def train_one_epoch_joint(
         else:
             L_contrast = torch.zeros((), device=device)
 
-        # ---- 汇总损失（关键分支）----
+        # ---- Aggregate the losses (critical branches) ----
         if phase == "A_EVI":
-            # 证据探针：不走分类
+            # Evidence probe: omit the classification loss
             loss = (lambda_e * L_evi_main) + L_aux + L_sparse + L_contrast
         elif phase == "A_CLS":
-            # 分类探针：不走证据
+            # Classification probe: omit the evidence loss
             loss = L_cls
         else:
-            # 联合期
+            # Joint phase
             loss = (cls_weight * L_cls) + (lambda_e * L_evi_main) + L_aux + L_sparse + L_contrast
 
         (loss / grad_accum).backward()
@@ -373,7 +373,7 @@ def train_one_epoch_joint(
 
     return total / max(1, seen)
 # =========================
-# 主流程（两阶段）
+# Main pipeline (two stages)
 # =========================
 def main():
     ap = argparse.ArgumentParser()
@@ -386,7 +386,7 @@ def main():
     ap.add_argument("--model_path", default="/root/autodl-tmp/models/Qwen2.5-VL-7B-Instruct/")
     ap.add_argument("--out_dir",    default="/root/autodl-tmp/outputs_lora_stage2")
     ap.add_argument("--lora_ckpt", default="/root/autodl-tmp/outputs_lora_stage1/best_by_AUROC_lora_only.pt",
-                help="Stage-1 的 LoRA 权重（lora_only.pt）")
+                help="Stage-1 LoRA weights (lora_only.pt)")
 
     # LoRA
     ap.add_argument("--lora_layers", default="15,23,31")
@@ -395,35 +395,35 @@ def main():
     ap.add_argument("--lora_dropout", type=float, default=0.05)
 
     # train
-    ap.add_argument("--epochs_head_probe", type=int, default=3, help="Stage-2A: 线性探针（只训头）")
-    ap.add_argument("--epochs_joint",      type=int, default=18, help="Stage-2B: 联合训练")
+    ap.add_argument("--epochs_head_probe", type=int, default=3, help="Stage-2A: linear probe (train the head only)")
+    ap.add_argument("--epochs_joint",      type=int, default=18, help="Stage-2B: joint training")
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--grad_accum", type=int, default=8)
     ap.add_argument("--num_workers", type=int, default=8)
 
-    # lr 设置：先线性探针（LoRA lr=0, Head lr > 0），再联合（LoRA:Head ≈ 5:1）
-    ap.add_argument("--head_lr_probe", type=float, default=3e-4, help="线性探针阶段：头学习率")
-    ap.add_argument("--lora_lr_joint", type=float, default=2.5e-5, help="联合阶段：LoRA lr")
-    ap.add_argument("--head_lr_joint", type=float, default=5e-6,   help="联合阶段：头 lr（≈LoRA的1/5）")
+    # LR setup: run the linear probe first (LoRA lr=0, head lr > 0), then joint training (LoRA:Head ≈ 5:1)
+    ap.add_argument("--head_lr_probe", type=float, default=3e-4, help="Head learning rate during the linear-probe stage")
+    ap.add_argument("--lora_lr_joint", type=float, default=2.5e-5, help="LoRA learning rate during the joint stage")
+    ap.add_argument("--head_lr_joint", type=float, default=5e-6,   help="Head learning rate during the joint stage (≈ one-fifth of LoRA)")
 
     ap.add_argument("--weight_decay_head", type=float, default=3e-4)
     ap.add_argument("--warmup_ratio", type=float, default=0.06)
     ap.add_argument("--min_lr_scale", type=float, default=0.06)
     ap.add_argument("--seed", type=int, default=42)
 
-    # 联合期损失权重
-    ap.add_argument("--lambda_e", type=float, default=1.0, help="证据损失权重（按你的要求=1）")
-    ap.add_argument("--evi_alpha", type=float, default=0.8, help="证据 BCE:Dice 混合权重")
-    ap.add_argument("--lambda_sparse", type=float, default=2e-4, help="稀疏项权重（保留）")
-    ap.add_argument("--lambda_contrast", type=float, default=0.0, help="对比项权重（先关）")
-    ap.add_argument("--pos_weight_cap", type=float, default=18.0, help="像素 BCE 正例权重上限")
+    # Joint-phase loss weights
+    ap.add_argument("--lambda_e", type=float, default=1.0, help="Evidence-loss weight (set to 1 as requested)")
+    ap.add_argument("--evi_alpha", type=float, default=0.8, help="Mixing weight between evidence BCE and Dice")
+    ap.add_argument("--lambda_sparse", type=float, default=2e-4, help="Sparsity-term weight (keep)")
+    ap.add_argument("--lambda_contrast", type=float, default=0.0, help="Contrast-term weight (off for now)")
+    ap.add_argument("--pos_weight_cap", type=float, default=18.0, help="Upper cap for the positive weight in pixel-level BCE")
 
     ap.add_argument("--lambda_e_phase1", type=float, default=1.0,
-                help="联合期前若干个epoch使用的证据损失权重 λ_e（默认1.0）")
+                help="Evidence-loss weight λ_e used during the early joint-training epochs (default 1.0)")
     ap.add_argument("--lambda_e_phase2", type=float, default=1.2,
-                help="联合期后续epoch使用的证据损失权重 λ_e（默认1.2）")
+                help="Evidence-loss weight λ_e used during later joint-training epochs (default 1.2)")
     ap.add_argument("--lambda_e_phase1_epochs", type=int, default=3,
-                help="联合期phase1持续的epoch数（默认3）")
+                help="Number of epochs that joint phase 1 lasts (default 3)")
 
     args = ap.parse_args()
     history = []  
@@ -454,32 +454,32 @@ def main():
     for p in qwen.parameters(): p.requires_grad = False
     qwen.eval()
 
-    # 只给视觉塔注入 LoRA（注意力层；不动 MLP）
+    # Inject LoRA only into the vision tower (attention layers; leave the MLP untouched)
     layers = [int(x) for x in args.lora_layers.split(",") if x.strip()]
     qwen.visual = inject_visual_lora_attn_only(
         qwen.visual, layers=layers, r=args.lora_r, alpha=args.lora_alpha, dropout=args.lora_dropout
     )
     
-    # === 在这里加载 Stage-1 的 LoRA 适配器 ===
+    # === Load the Stage-1 LoRA adapter here ===
     ok = load_visual_lora_state_dict(qwen.visual, args.lora_ckpt)
     if not ok:
-        raise RuntimeError(f"Failed to load LoRA from {args.lora_ckpt}. 请检查 rank/alpha/target_modules 与 Stage-1 一致。")
+        raise RuntimeError(f"Failed to load LoRA from {args.lora_ckpt}. Please verify that rank/alpha/target_modules match Stage-1.")
     
-    # taps & heads（两头随机初始化）
-    visual_tap = QwenVisualTap(qwen.visual, layers=(7,15,23,31)).to(device)  # 注意：tap 已绑定到“带LoRA的core”
+    # taps & heads (both heads randomly initialized)
+    visual_tap = QwenVisualTap(qwen.visual, layers=(7,15,23,31)).to(device)  # Note: the tap is already bound to the core that includes LoRA
     heads = ForensicJoint(fuse_in_ch=1280, fuse_out_ch=512, layers=(7,15,23,31)).to(device)
 
-    # 用 64×64 版本的证据头替换
+    # replace with the 64×64 version of the evidence head
     heads.evi = EvidenceHead64(in_ch=512).to(device)
     
-    # 按先验做初始化（π1=正样本比例；πpix=假图像素占比）
+    # initialize with priors (π₁ = positive-sample ratio; π_pix = fake-image pixel ratio)
     init_joint_heads_with_priors(heads, p1_prior=0.5, pix_prior=0.03)
-    # ============ Stage-2A：证据探针（只训 fuser+evi；LoRA 与 cls 冻结） ============
+    # ============ Stage-2A: evidence probe (train fuser+evi only; freeze LoRA and cls) ============
     for n, p in qwen.visual.named_parameters():
         if "lora_" in n:
             p.requires_grad = False
     
-    # 冻结分类头，只训练 fuser + evi
+    # Freeze the classification head; train only the fuser + evidence head
     for p in heads.cls.parameters():
         p.requires_grad = False
     for p in heads.fuser.parameters():
@@ -509,7 +509,7 @@ def main():
             heads, visual_tap, dl_tr, opt_probe, device,
             epoch_idx=epoch, total_epochs=args.epochs_head_probe,
             grad_accum=args.grad_accum, scheduler=sched_probe,
-            # 证据探针：不算分类
+            # Evidence probe: do not compute the classification loss
             cls_weight=0.0,
             lambda_e=args.lambda_e,
             evi_alpha=args.evi_alpha,
@@ -525,7 +525,7 @@ def main():
         print(f"[Probe/EVI] IoU: {metrics_evi['mean_iou']:.4f} | Dice: {metrics_evi['mean_dice']:.4f} | "
               f"AUROC: {metrics_cls['auroc']:.4f} | ACC@0.5: {metrics_cls['acc']:.4f}")
     
-        # 记录 CSV（标记 phase=A_evi）
+        # Log to CSV (marking phase = A_evi)
         rowA = {
             "phase": "A_evi",
             "epoch": int(epoch),
@@ -546,7 +546,7 @@ def main():
         }
         history.append(rowA)
     
-        # 保存 best（以 IoU 为主，同时保留 AUROC best）
+        # Save the best models (prioritize IoU, also keep the AUROC best)
         if metrics_cls["auroc"] > best_auc + 1e-6:
             best_auc = metrics_cls["auroc"]
             torch.save(heads.state_dict(), os.path.join(args.out_dir, "best_head_by_AUROC_probe_evi.pt"))
@@ -554,7 +554,7 @@ def main():
             best_iou = float(metrics_evi["mean_iou"])
             torch.save(heads.state_dict(), os.path.join(args.out_dir, "best_head_by_IoU_probe_evi.pt"))
 
-    # ============ Stage-2B：联合训练（LoRA:Head ≈ 5:1） ============
+    # ============ Stage-2B: joint training (LoRA:Head ≈ 5:1) ============
     qwen.visual.train()
     for n, p in qwen.visual.named_parameters():
         if "lora_" in n: 
@@ -564,7 +564,7 @@ def main():
     cls_head_params      = [p for n,p in heads.cls.named_parameters()   if p.requires_grad]
     evidence_head_params = [p for n,p in heads.evi.named_parameters()   if p.requires_grad]
     
-    # LoRA 组（确保只拿到 lora_* 且 requires_grad=True 的参数）
+    # LoRA group (ensure we only grab parameters whose names contain lora_* and require_grad=True)
     lora_params = [p for n,p in qwen.visual.named_parameters()
                    if p.requires_grad and "lora_" in n]
     #head_params = list(heads.parameters())
@@ -573,7 +573,7 @@ def main():
         {"params": lora_params,            "lr": args.lora_lr_joint, "weight_decay": 0.0},
         {"params": fuser_params,           "lr": args.head_lr_joint * 0.8, "weight_decay": args.weight_decay_head},
         {"params": cls_head_params,        "lr": args.head_lr_joint * 1.0, "weight_decay": args.weight_decay_head},
-        {"params": evidence_head_params,   "lr": args.head_lr_joint * 1.2, "weight_decay": args.weight_decay_head},  # ← 1.2~1.5
+        {"params": evidence_head_params,   "lr": args.head_lr_joint * 1.2, "weight_decay": args.weight_decay_head},  # ← about 1.2~1.5
     ])
     
     steps_per_epoch = math.ceil(len(dl_tr) / max(1, args.grad_accum))
@@ -587,7 +587,7 @@ def main():
     print(f"\n[Stage-2B] Joint training for {args.epochs_joint} epochs (LoRA:Head ≈ 5:1)")
     
     for epoch in range(1, args.epochs_joint + 1):
-        # ---- 先算 lam_e_now，再打印 ----
+        # ---- Compute lam_e_now first, then print ----
         lam_e_now = args.lambda_e_phase1 if epoch <= args.lambda_e_phase1_epochs else args.lambda_e_phase2
         lrs = [pg["lr"] for pg in optimizer.param_groups]
         print(f"Epoch {epoch}/{args.epochs_joint} | lr_lora={lrs[0]:.2e} | lr_head={lrs[1]:.2e} | lambda_e={lam_e_now:.2f}")
@@ -596,7 +596,7 @@ def main():
             heads, visual_tap, dl_tr, optimizer, device,
             epoch_idx=epoch, total_epochs=args.epochs_joint,
             grad_accum=args.grad_accum, scheduler=scheduler,
-            lambda_e=lam_e_now,                      # ← 用当前分段值
+            lambda_e=lam_e_now,                      # ← use the current piecewise value
             evi_alpha=args.evi_alpha,
             lambda_sparse=args.lambda_sparse, lambda_contrast=args.lambda_contrast,
             pos_weight_cap=args.pos_weight_cap, phase="B"
@@ -607,13 +607,13 @@ def main():
         print(f"Joint | AUROC: {metrics_cls['auroc']:.4f} | ACC@0.5: {metrics_cls['acc']:.4f} | "
               f"F1@0.5: {metrics_cls['f1']:.4f} | IoU: {metrics_evi['mean_iou']:.4f} | Dice: {metrics_evi['mean_dice']:.4f}")
     
-        # —— CSV 行里也写 lam_e_now —— #
+        # —— Also write lam_e_now into the CSV rows —— #
         rowB = {
             "phase": "B",
             "epoch": int(epoch),
             "lr_lora": float(lrs[0]),
             "lr_head": float(lrs[1]),
-            "lambda_e": float(lam_e_now),           # ← 这里
+            "lambda_e": float(lam_e_now),           # ← right here
             "evi_alpha": float(args.evi_alpha),
             "lambda_sparse": float(args.lambda_sparse),
             "val_auroc": float(metrics_cls.get("auroc", float("nan"))),
@@ -627,7 +627,7 @@ def main():
             "val_mean_dice": float(metrics_evi.get("mean_dice", float("nan"))),
         }
         history.append(rowB)
-        # ====== 落盘 CSV 日志 ======
+        # ====== Persist the CSV log ======
         try:
             df = pd.DataFrame(history, columns=[
                 "phase","epoch","lr_lora","lr_head","lambda_e","evi_alpha","lambda_sparse",
@@ -641,7 +641,7 @@ def main():
         except Exception as e:
             print(f"[WARN] failed to save training_log_stage2.csv: {e}")
 
-        # —— 双 best 策略：分别保存头（state_dict）与 LoRA adapter —— #
+        # —— Dual-best strategy: save the head state_dict and the LoRA adapter separately —— #
         if metrics_cls["auroc"] > best_auc + 1e-6:
             best_auc = metrics_cls["auroc"]
             torch.save({
@@ -649,7 +649,7 @@ def main():
                 "metric": {"auroc": best_auc},
                 "heads": heads.state_dict()
             }, os.path.join(args.out_dir, "best_by_AUROC_joint_lora.pt"))
-            # 单独落盘 heads / LoRA
+            # Save the heads / LoRA separately
             torch.save(heads.state_dict(), os.path.join(args.out_dir, "best_heads_by_AUROC.pt"))
             if isinstance(qwen.visual, PeftModel):
                 qwen.visual.save_pretrained(os.path.join(args.out_dir, "best_lora_by_AUROC"))
@@ -668,7 +668,7 @@ def main():
                 qwen.visual.save_pretrained(os.path.join(args.out_dir, "best_lora_by_IoU"))
             print("[SAVE] best IoU heads & LoRA saved.")
 
-    # 统一再落一份“最后 LoRA adapter”
+    # Finally drop an additional copy of the “latest LoRA adapter”
     if isinstance(qwen.visual, PeftModel):
         qwen.visual.save_pretrained(os.path.join(args.out_dir, "lora_visual_adapter_last"))
         print("[SAVE] LoRA adapter (last) saved.")

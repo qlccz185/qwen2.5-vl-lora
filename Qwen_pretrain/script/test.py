@@ -120,7 +120,7 @@ def collate_joint_test(batch, processor, fixed_res=448):
     messages, masks, labels, paths, vis_imgs = [], [], [], [], []
     for rec in batch:
         im448 = resize_square_pad_rgb(rec["image"], fixed_res)
-        vis_imgs.append(im448)  # 可视化
+        vis_imgs.append(im448)  # for visualization
         messages.append({"role":"user","content":[{"type":"image","image":im448},{"type":"text","text":"."}]})
 
         m = rec["mask"]
@@ -247,7 +247,7 @@ def eval_classification(model, visual_tap, dl, device, thr_cls=0.5):
     model.eval()
     all_prob, all_y = [], []
     for batch in tqdm(dl, desc="Eval/Cls"):
-        # 兼容 4/5 元
+        # support both 4- and 5-tuple batches
         if len(batch) == 5:
             (inputs, labels, masks, paths, vis_imgs) = batch
         else:
@@ -285,7 +285,7 @@ def eval_evidence(model, visual_tap, dl, device, thr_map=0.5, only_fake=True, sk
             (inputs, labels, masks, paths) = batch
         inputs = {k: v.to(device) for k,v in inputs.items()}
         labels = labels.to(device)
-        masks  = masks.to(device)  # [B,448,448] (已二值化或接近二值)
+        masks  = masks.to(device)  # [B,448,448] (already binarized or nearly so)
 
         grids  = visual_tap(inputs["pixel_values"], inputs["image_grid_thw"])
         grids  = {k: v.float() for k,v in grids.items()}
@@ -306,7 +306,7 @@ def eval_evidence(model, visual_tap, dl, device, thr_map=0.5, only_fake=True, sk
             gt64   = gt64[idx]
 
         if skip_empty_gt:
-            # 过滤掉 GT 全零的样本
+            # filter out samples whose GT mask is entirely zero
             keep = (gt64.view(gt64.size(0), -1).sum(dim=1) > 0)
             if not keep.any():
                 continue
@@ -358,7 +358,7 @@ def visualize_random(model, visual_tap, dl, device, out_dir, k=3):
             pm  = prob[i].cpu().numpy()
             gt  = masks_np[i]
 
-            # 红色叠加
+            # red overlay
             heat = (pm * 255.0).clip(0,255).astype(np.uint8)
             overlay = np.array(img).astype(np.float32)
             overlay[...,0] = np.clip(overlay[...,0] * 0.65 + heat*0.35, 0, 255)

@@ -98,7 +98,7 @@ class QwenVisualTap(nn.Module):
                 for b in range(B):
                     H, W = int(thw[b,1]), int(thw[b,2])
                     L = H*W
-                    seg = feat[b, 1:1+L, :]           # 跳过 cls
+                    seg = feat[b, 1:1+L, :]           # skip the CLS token
                     C = seg.size(-1)
                     seg = seg.transpose(0,1).contiguous().reshape(C, H, W)
                     if H != H_max or W != W_max:
@@ -642,7 +642,7 @@ def main():
             json.dump({"temperature": T_star, "threshold": thr_star}, f, indent=2)
         print(f"[CALIB] Saved calibration to {calib_path}")
     else:
-        print(f"[WARN] best_by_AUROC.pt not found in {args.out_dir}; 跳过训练后校准。")
+        print(f"[WARN] best_by_AUROC.pt not found in {args.out_dir}; skip post-training calibration.")
 
 
     T_star = calibrate_temperature(heads, visual_tap, dl_val, device)
