@@ -77,7 +77,7 @@ class ForgeryClsDataset(Dataset):
         return {"image": img, "label": rec["label"], "path": str(rec["img"])}
 
 # =========================================
-# Collate（固定 448）
+# Collate
 # =========================================
 def collate_and_process(batch, processor, fixed_res=448):
     messages = []
@@ -99,11 +99,11 @@ def collate_and_process(batch, processor, fixed_res=448):
     return inputs, labels, paths
 
 # =========================================
-# Qwen visual tap（修复：PEFT 下调用 base_model）
+# Qwen visual tap
 # =========================================
 class QwenVisualTap(nn.Module):
     """
-    只 hook 视觉 blocks 若干层输出；返回对齐到同一网格的特征：
+ 
     grids: {layer_idx: [B, C, H_max, W_max]}
     """
     def __init__(self, visual, layers=(7, 15, 23, 31)):
@@ -111,7 +111,7 @@ class QwenVisualTap(nn.Module):
         self.layers = list(layers)
         self._feat_cache = {}
         self._hooks = []
-        self.rebind(visual)  # 初始化时就完成绑定
+        self.rebind(visual) 
 
     def _make_hook(self, idx):
         def _hook(module, inp, out):
@@ -120,7 +120,7 @@ class QwenVisualTap(nn.Module):
         return _hook
 
     def _pad_to(self, seg, H, W, H_max, W_max):
-        # seg: [C,H,W]  —— 注意：这里不要 no_grad，Stage-2 需要回传梯度
+        # seg: [C,H,W]  
         if H != H_max or W != W_max:
             seg = F.pad(seg, (0, W_max - W, 0, H_max - H), value=0.0)
         return seg
@@ -135,9 +135,7 @@ class QwenVisualTap(nn.Module):
         self._hooks = []
 
     def rebind(self, visual):
-        """
-        当 visual 被 PEFT 包装/替换后，调用一次以重挂 hooks。
-        """
+
         self.visual = visual
         self.core = getattr(visual, "base_model", visual)  # 真正执行 forward 的对象
         self._clear_hooks()
@@ -147,19 +145,19 @@ class QwenVisualTap(nn.Module):
     def forward(self, pixel_values, thw):
         self._feat_cache.clear()
 
-        # 与 core 参数 dtype 对齐，避免硬编码 bfloat16
+ 
         dtype = next(self.core.parameters()).dtype
         pv = pixel_values.to(dtype=dtype)
-        _ = self.core(pv, thw)  # 必须走 core，确保触发 hooks
+        _ = self.core(pv, thw) 
 
-        # 形状还原
+ 
         thw_list = thw.tolist() if isinstance(thw, torch.Tensor) else thw
         Hs = [int(v[1]) for v in thw_list]
         Ws = [int(v[2]) for v in thw_list]
         B = pv.shape[0]
         H_max, W_max = max(Hs), max(Ws)
 
-        # 自检
+   
         missing = [i for i in self.layers if i not in self._feat_cache]
         if missing:
             raise RuntimeError(f"[VIS TAP] hooks not triggered for layers: {missing}. "
@@ -167,13 +165,13 @@ class QwenVisualTap(nn.Module):
 
         grids = {}
         for i in self.layers:
-            feat = self._feat_cache[i]  # [B,L_pad,C] 或 [Total_L,C]
+            feat = self._feat_cache[i]  
             if feat.dim() == 3:  # [B, L_pad, C]
                 per_samples = []
                 for b in range(B):
                     H, W = int(Hs[b]), int(Ws[b])
                     L = H * W
-                    seg = feat[b, 1:1 + L, :].transpose(0, 1).contiguous().reshape(-1, H, W)  # 跳过 CLS
+                    seg = feat[b, 1:1 + L, :].transpose(0, 1).contiguous().reshape(-1, H, W)  
                     seg = self._pad_to(seg, H, W, H_max, W_max)
                     per_samples.append(seg)
                 layer_grid = torch.stack(per_samples, dim=0)
@@ -194,7 +192,7 @@ class QwenVisualTap(nn.Module):
         self._clear_hooks()
 
 # =========================================
-# Heads（ForensicCls：多层融合 + 分类）
+# Heads（ForensicCls）
 # =========================================
 class GeM(nn.Module):
     def __init__(self, p=3.0, eps=1e-6):
@@ -208,10 +206,8 @@ class GeM(nn.Module):
         return x.pow(1.0 / self.p).flatten(1)
 
 class MiniFuse(nn.Module):
-    """
-    对 (7,15,23,31) 四层 grid 做 1x1 通道对齐 → 深度卷积混合 → 1x1 压到 out
-    输入每层通道数都是 1280（Qwen2.5-VL 视觉塔宽度）
-    """
+
+
     def __init__(self, in_ch=1280, layers=4, mid=512, out=512):
         super().__init__()
         self.proj = nn.ModuleList([nn.Conv2d(in_ch, mid, 1) for _ in range(layers)])
@@ -239,9 +235,7 @@ class ClsHead(nn.Module):
         return self.fc2(x)[:, 0]  # [B]
 
 class ForensicCls(nn.Module):
-    """
-    从多层视觉特征融合 → 分类分数
-    """
+
     def __init__(self, fuse_in_ch=1280, fuse_out_ch=512, layers=(7,15,23,31), head_hidden=256):
         super().__init__()
         self.layers = tuple(layers)
@@ -334,7 +328,7 @@ def train_one_epoch(qwen, head, visual_tap, data_loader, optimizer, loss_fn, dev
     total_loss, n_samples = 0.0, 0
     optimizer.zero_grad(set_to_none=True)
 
-    # 阶段判断：epoch 基准足够稳妥（避免与 step/accum 细节耦合）
+
     in_stage2 = (epoch_idx > freeze_epochs_head)
     loss_scale = (cls_loss_scale_after if in_stage2 and cls_loss_scale_after > 1.0 else 1.0)
 
@@ -344,7 +338,7 @@ def train_one_epoch(qwen, head, visual_tap, data_loader, optimizer, loss_fn, dev
 
         grids = visual_tap(inputs["pixel_values"], inputs["image_grid_thw"])
         logits = head(grids)
-        # —— 关键：阶段2按系数放大 BCE，增强反传到 LoRA 的梯度强度 ——
+     
         loss = (loss_fn(logits, labels) * loss_scale) / grad_accum
 
         if step == 1:
@@ -398,10 +392,10 @@ def build_tiny_balanced_subset(ds, per_class=32):
     return torch.utils.data.Subset(ds, tiny_idx)
 
 # =========================================
-# LoRA 注入（只打 visual，Attn-only），并仅启用指定 blocks 的 LoRA 参数
+
 # =========================================
 def inject_visual_lora_attn_only(visual, layers=(23,31), r=8, alpha=16, dropout=0.05):
-    target = ["attn.qkv", "attn.proj"]  # 只打注意力
+    target = ["attn.qkv", "attn.proj"]  
     cfg = LoraConfig(
         task_type=TaskType.FEATURE_EXTRACTION,
         r=r, lora_alpha=alpha, lora_dropout=dropout,
@@ -429,7 +423,7 @@ def inject_visual_lora_attn_only(visual, layers=(23,31), r=8, alpha=16, dropout=
 # =========================================
 def main():
     ap = argparse.ArgumentParser()
-    # ======= 基础训练参数 =======
+
     ap.add_argument("--epochs", type=int, default=22)
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--grad_accum", type=int, default=8)
