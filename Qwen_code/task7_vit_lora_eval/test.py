@@ -77,13 +77,13 @@ class ForgeryJointValDataset(Dataset):
             y = int(rec.get("label", 0))
             mp = rec.get("mask_path", "")
 
-            # ---------- 拼接图片路径 ----------
+            
             img_p = (self.root / img_rel).resolve()
             if not img_p.exists():
                 print(f"[WARN] image not found: {img_p}")
                 continue
 
-            # ---------- 拼接掩码路径 ----------
+            
             if y == 1:
                 mask_p = None
                 if mp and isinstance(mp, str) and not ("x" in mp.lower()):
