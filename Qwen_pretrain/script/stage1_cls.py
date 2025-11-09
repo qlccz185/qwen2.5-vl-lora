@@ -120,7 +120,7 @@ class QwenVisualTap(nn.Module):
         return grids
 
 # -------------------------
-# Heads（对齐）
+# Heads
 # -------------------------
 class GeM(nn.Module):
     def __init__(self, p=3.0, eps=1e-6):
@@ -164,7 +164,7 @@ class ForensicCls(nn.Module):
         fused = self.fuser(grids)
         return self.cls(fused)
 
-# 线性探针
+
 class LinearProbe(nn.Module):
     def __init__(self, in_ch=1280, layer=31):
         super().__init__()
@@ -184,7 +184,7 @@ def resize_square_pad(img: Image.Image, size=448, pad_color=(128,128,128)):
     canvas.paste(img, ((size - nw) // 2, (size - nh) // 2))
     return canvas
 
-# Collate（固定 448）
+
 def collate_and_process(batch, processor, fixed_res=448):
     messages = []
     for rec in batch:
@@ -205,7 +205,7 @@ def collate_and_process(batch, processor, fixed_res=448):
     return inputs, labels, paths
 
 # -------------------------
-# Evaluate（无 EMA）
+
 # -------------------------
 @torch.no_grad()
 def evaluate(model, visual_tap, data_loader, device):
@@ -223,7 +223,7 @@ def evaluate(model, visual_tap, data_loader, device):
     y_true = np.concatenate(ys).astype(np.int64)
     y_prob = np.concatenate(ps)            # shape [N]
 
-    # --- AUROC（与阈值无关）
+
     try:
         auroc = roc_auc_score(y_true, y_prob)
     except Exception:
@@ -233,14 +233,13 @@ def evaluate(model, visual_tap, data_loader, device):
     y_pred05 = (y_prob >= 0.5).astype(np.int32)
     acc05 = accuracy_score(y_true, y_pred05)
 
-    # --- thr_accopt：扫描阈值，取 ACC 最大
-    # 用所有唯一概率作为候选阈值（含边界），避免 PR 曲线依赖
+
     uniq = np.unique(y_prob[~np.isnan(y_prob)])
     if uniq.size == 0:
         thr_accopt = float("nan")
         acc_star   = float("nan")
     else:
-        # 在相邻概率中点 + 两侧边界上评估
+     
         thr_cands = []
         thr_cands.append(uniq[0] - 1e-12)
         thr_cands.extend((uniq[:-1] + uniq[1:]) * 0.5)
@@ -256,7 +255,7 @@ def evaluate(model, visual_tap, data_loader, device):
         thr_accopt = float(best_thr)
         acc_star   = float(best_acc)
 
-    # --- F1*：同理，直接在相同候选阈值上找 F1 最大
+
     if uniq.size == 0:
         thr_f1opt = float("nan")
         f1_opt    = float("nan")
@@ -270,7 +269,7 @@ def evaluate(model, visual_tap, data_loader, device):
         thr_f1opt = float(best_thr_f1)
         f1_opt    = float(best_f1)
 
-    # --- 方向自检（可留可去）
+
     try:
         auc_flip = roc_auc_score(y_true, 1.0 - y_prob)
         if auc_flip > auroc + 1e-4:
@@ -287,10 +286,7 @@ def evaluate(model, visual_tap, data_loader, device):
 
 @torch.no_grad()
 def calibrate_temperature(model, visual_tap, data_loader, device):
-    """
-    在验证集上用 NLL 找到最佳温度 T*（不改模型参数，只学习一个标量 T）。
-    返回 float(T_star)。
-    """
+
     model.eval()
     logits_all, y_all = [], []
     for inputs, labels, _ in data_loader:
@@ -320,9 +316,7 @@ def calibrate_temperature(model, visual_tap, data_loader, device):
 
 @torch.no_grad()
 def evaluate_calibrated(model, visual_tap, data_loader, device, temperature: float = 1.0, fixed_thr: float = None):
-    """
-    与 evaluate 类似，但支持温度缩放；若给定 fixed_thr，则额外返回该阈值下的 ACC/F1。
-    """
+
     model.eval()
     ys, ps = [], []
     for inputs, labels, _ in data_loader:
@@ -337,7 +331,7 @@ def evaluate_calibrated(model, visual_tap, data_loader, device, temperature: flo
     y_true = np.concatenate(ys).astype(np.int64)
     y_prob = np.concatenate(ps)  # [N]
 
-    # ——标准指标（与你的 evaluate 基本一致）——
+
     try:
         auroc = roc_auc_score(y_true, y_prob)
     except Exception:
@@ -357,9 +351,9 @@ def evaluate_calibrated(model, visual_tap, data_loader, device, temperature: flo
         thr_cands.append(uniq[-1] + 1e-12)
         thr_cands = np.array(thr_cands, dtype=np.float64)
 
-        # ACC 最优阈值
+
         best_acc, best_thr = -1.0, 0.5
-        # F1 最优阈值
+
         best_f1, best_thr_f1 = -1.0, 0.5
         for t in thr_cands:
             pred = (y_prob >= t).astype(np.int32)
@@ -381,7 +375,7 @@ def evaluate_calibrated(model, visual_tap, data_loader, device, temperature: flo
         "temperature": float(temperature),
     }
 
-    # ——如果给了固定阈值，也返回该阈值下的 ACC/F1——
+
     if fixed_thr is not None and not np.isnan(fixed_thr):
         pred_fixed = (y_prob >= fixed_thr).astype(np.int32)
         out["acc_fixed"] = accuracy_score(y_true, pred_fixed)
@@ -416,7 +410,7 @@ def train_one_epoch(model, visual_tap, data_loader, optimizer, loss_fn, device,
         logits = model(grids)
         loss = loss_fn(logits, labels) / grad_accum
 
-        # 首 batch调试
+
         if step == 1:
             with torch.no_grad():
                 p = torch.sigmoid(logits); pos = (labels == 1)
@@ -483,7 +477,7 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    # --- 数据集 ---
+
     train_ann = str(Path(args.split_dir) / "train_idx.json")
     val_ann   = str(Path(args.split_dir) / "val_idx.json")
     ds_train = ForgeryClsDataset(train_ann, data_root="/root/data", invert_label=False)
@@ -494,7 +488,7 @@ def main():
     cnt1 = len(ds_train) - cnt0
     print(f"[CHECK] train labels -> real(0)={cnt0}, fake(1)={cnt1}")
 
-    # --- 模型/processor ---
+
     processor = AutoProcessor.from_pretrained(args.model_path)
     qwen = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         args.model_path, torch_dtype=torch.bfloat16, device_map="auto", attn_implementation="flash_attention_2"
@@ -503,15 +497,15 @@ def main():
     qwen.eval()
     visual_tap = QwenVisualTap(qwen.visual, layers=(7,15,23,31)).to(device)
 
-    # --- 烟雾测试：裁 64 样本 + 线性探针 ---
+
     if args.smoke:
         ds_train = build_tiny_balanced_subset(ds_train, per_class=32)
         ds_val   = ds_train
-        # 给足迭代以便过拟合上去
+
         args.epochs = 20
         args.batch_size = min(args.batch_size, 32)
         args.grad_accum = 1
-        # 线性探针（确保你在文件里已有 LinearProbe 实现；否则换成 ForensicCls 也可）
+
         heads = LinearProbe(in_ch=1280, layer=31).to(device)
     else:
         heads = ForensicCls(fuse_in_ch=1280, fuse_out_ch=512, layers=(7,15,23,31)).to(device)
@@ -524,9 +518,9 @@ def main():
                           num_workers=args.num_workers, pin_memory=True, persistent_workers=True,
                           collate_fn=collate_fn)
 
-    # ---- 优化器 / 调度 ----
+
     if args.smoke:
-        # 小步子先收敛，避免 logit 直接饱和
+       
         lr = 3e-4
         optimizer = torch.optim.AdamW(heads.parameters(), lr=lr, weight_decay=1e-2)
         scheduler = None
@@ -541,7 +535,7 @@ def main():
         lr_lambda = build_warmup_cosine(total_steps, warmup_ratio=args.warmup_ratio, min_lr_scale=args.min_lr_scale)
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # ---- 输出层 bias 先验（按训练集正例率）----
+
     pos_cnt = sum(ds_train[i]["label"] == 1 for i in range(len(ds_train)))
     p = max(1e-4, min(1 - 1e-4, pos_cnt / max(1, len(ds_train))))
     with torch.no_grad():
@@ -553,7 +547,6 @@ def main():
 
     bce_logits = nn.BCEWithLogitsLoss()
 
-    # ---- 训练循环 ----
     bests = {"auroc": (-1.0, None), "acc05": (-1.0, None), "accstar": (-1.0, None), "f1star": (-1.0, None)}
     history = []
     
@@ -568,7 +561,7 @@ def main():
             grad_clip=1.0, grad_accum=args.grad_accum, scheduler=scheduler
         )
     
-        # ---- 验证（未校准）----
+
         metrics = evaluate(heads, visual_tap, dl_val, device)
         auroc   = metrics["auroc"]
         acc05   = metrics["acc_05"]
@@ -594,7 +587,7 @@ def main():
             "lr": float(optimizer.param_groups[0]['lr']),
         })
     
-        # ---- 保存 best（按不同指标）----
+
         def _save_best(key, score, fname):
             nonlocal bests
             if score > bests[key][0] + 1e-12:
@@ -607,13 +600,12 @@ def main():
         _save_best("acc05",  metrics["acc_05"],    "best_by_ACC05.pt")
         _save_best("accstar",metrics["acc_star"],  "best_by_ACCstar.pt")
         _save_best("f1star", metrics["f1_opt"],    "best_by_F1star.pt")
-    
-        # ---- 保存最近 checkpoint ----
+
         torch.save({"epoch": epoch, "state_dict": heads.state_dict(),
                     "metric": metrics, "args": vars(args)},
                    os.path.join(args.out_dir, f"last_epoch_{epoch:03d}.pt"))
     
-        # ---- Early Stopping（以 AUROC 为准）----
+
         if auroc > best_metric + args.min_delta:
             best_metric = auroc
             best_epoch = epoch
@@ -625,7 +617,7 @@ def main():
                   f"(best AUROC={best_metric:.4f} @ epoch {best_epoch}).")
             break
     
-    # === 训练循环“结束后”再做温度校准 ===
+
     best_auroc_ckpt = os.path.join(args.out_dir, "best_by_AUROC.pt")
     if os.path.exists(best_auroc_ckpt):
         ckpt = torch.load(best_auroc_ckpt, map_location="cpu")
@@ -633,10 +625,10 @@ def main():
         heads.to(device).eval()
         print(f"[LOAD] Loaded best_by_AUROC from {best_auroc_ckpt}")
     
-        # 1) 在验证集上拟合温度 T*
+ 
         T_star = calibrate_temperature(heads, visual_tap, dl_val, device)
     
-        # 2) 温度缩放后重新搜阈值 thr*
+ 
         metrics_cal = evaluate_calibrated(heads, visual_tap, dl_val, device,
                                           temperature=T_star, fixed_thr=None)
         thr_star = float(metrics_cal["thr_accopt"])
@@ -644,7 +636,7 @@ def main():
               f"AUROC={metrics_cal['auroc']:.4f}, "
               f"ACC@thr*={metrics_cal['acc_star']:.4f} @thr*={thr_star:.3f}")
     
-        # 3) 保存校准文件
+
         calib_path = os.path.join(args.out_dir, "calibration.json")
         with open(calib_path, "w") as f:
             json.dump({"temperature": T_star, "threshold": thr_star}, f, indent=2)
@@ -652,24 +644,23 @@ def main():
     else:
         print(f"[WARN] best_by_AUROC.pt not found in {args.out_dir}; 跳过训练后校准。")
 
-    
-    # 1) 在验证集上拟合温度 T*
+
     T_star = calibrate_temperature(heads, visual_tap, dl_val, device)
     
-    # 2) 用温度缩放后重新搜阈值 thr*
+
     metrics_cal = evaluate_calibrated(heads, visual_tap, dl_val, device,
                                       temperature=T_star, fixed_thr=None)
     thr_star = float(metrics_cal["thr_accopt"])
     print(f"[CALIB] After temperature scaling: AUROC={metrics_cal['auroc']:.4f}, "
           f"ACC@thr*={metrics_cal['acc_star']:.4f} @thr*={thr_star:.3f}")
     
-    # 3) 保存校准参数
+
     calib_path = os.path.join(args.out_dir, "calibration.json")
     with open(calib_path, "w") as f:
         json.dump({"temperature": T_star, "threshold": thr_star}, f, indent=2)
     print(f"[CALIB] Saved calibration to {calib_path}")
     
-    # 4) 保存训练日志
+
     import pandas as pd
     pd.DataFrame(history).to_csv(os.path.join(args.out_dir, "training_log.csv"), index=False)
     print("Saved log to training_log.csv")
