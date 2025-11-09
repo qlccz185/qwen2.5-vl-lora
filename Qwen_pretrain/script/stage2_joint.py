@@ -59,11 +59,11 @@ class ForgeryJointDataset(Dataset):
         arr = json.loads(ann_path.read_text(encoding="utf-8"))
         assert isinstance(arr, list) and len(arr) > 0, f"Empty ann: {ann_path}"
 
-        # 常见根目录
+        # common root directories
         self.img_dirs  = [
             self.root / "trainingsetbig/image",
             self.root / "trainingset2/image",
-            self.root / "trainingset2/trainingset2/image",  # 兼容旧奇怪层级
+            self.root / "trainingset2/trainingset2/image",  # handle the odd legacy directory hierarchy
         ]
         self.mask_dirs = [
             self.root / "trainingsetbig/spatial_localize",
@@ -147,16 +147,16 @@ class ForgeryJointDataset(Dataset):
             if isinstance(m, Path):
                 mask = Image.open(m).convert("L")
             else:
-                mask = None  # 假图但没掩码
+                mask = None  # fake image but no mask available
         else:
             H, W = m
             mask = Image.new("L", (W, H), 0)
         return {"image": img, "label": y, "mask": mask, "path": str(rec["img"])}
 
-# Collate（与 Qwen processor 对齐）+ mask letterbox
+# Collate (aligned with the Qwen processor) + mask letterbox
 
 def resize_square_pad_mask(img: Image.Image, size=448):
-    # 灰度掩码专用：保持单通道
+    # dedicated to grayscale masks: keep a single channel
     if img.mode != "L":
         img = img.convert("L")
     w, h = img.size
@@ -177,12 +177,12 @@ def collate_joint(batch, processor, fixed_res=448):
         if m is None:
             arr = np.zeros((fixed_res, fixed_res), dtype=np.float32)
         else:
-            m_res = resize_square_pad_mask(m, fixed_res)      # 单通道
+            m_res = resize_square_pad_mask(m, fixed_res)      # single channel
             arr = np.array(m_res, dtype=np.float32)
             if arr.max() > 1.0:
                 arr /= 255.0
 
-        # 先二值化，再 append
+        # binarize first, then append
         if rec["label"] == 1:
             p99 = np.percentile(arr, 99)
             thr = 0.2 * float(p99)
@@ -202,8 +202,8 @@ def collate_joint(batch, processor, fixed_res=448):
     
 class QwenVisualTap(nn.Module):
     """
-    从视觉塔 blocks 取特征；返回 {layer_idx: [B,C,Hmax,Wmax]}
-    hooks 挂 core（visual.base_model），forward 也走 core
+    Extract features from the vision-tower blocks; return {layer_idx: [B,C,H_max,W_max]}
+    hooks attach to the core (visual.base_model), and forward also runs through the core
     """
     def __init__(self, visual, layers=(15,23,31)):
         super().__init__()
@@ -238,7 +238,7 @@ class QwenVisualTap(nn.Module):
         pv  = pixel_values.to(device=dev, dtype=dtype)
         thw = thw.to(dev) if isinstance(thw, torch.Tensor) else thw
 
-        _ = self.core(pv, thw)  # 触发 hooks
+        _ = self.core(pv, thw)  # trigger the hooks
 
         thw_list = thw.tolist() if isinstance(thw, torch.Tensor) else thw
         Hs = [int(v[1]) for v in thw_list]; Ws = [int(v[2]) for v in thw_list]
@@ -268,7 +268,7 @@ class QwenVisualTap(nn.Module):
 
 #visual_tap = QwenVisualTap(qwen.visual, layers=(15,23,31)).to(device)
 
-# ===== 头结构（与 LoRA 期一致：MiniFuse(3路)+ClsHead+EvidenceHead64）=====
+# ===== Head structure (same as the LoRA phase: MiniFuse (3 branches) + ClsHead + EvidenceHead64) =====
 # ========== Shared Components ==========
 class GeM(nn.Module):
     def __init__(self, p=3.0, eps=1e-6):
@@ -293,7 +293,7 @@ class MiniFuse(nn.Module):
         return self.pw(z)
 
 class ClsHead(nn.Module):
-    """完全与 Stage 2.1 一致"""
+    """Exactly the same as Stage 2.1"""
     def __init__(self, in_ch, hidden=256, use_l2norm=True, dropout=0.0):
         super().__init__()
         self.pool   = GeM()
@@ -378,10 +378,10 @@ def focal_bce_with_logits(logits, targets, alpha=0.25, gamma=2.0):
 # Train
 def _unpack_heatmap(hm_out):
     """
-    统一把证据头输出拆成 (hm32_opt, hm64_req)
-    - 若是 tuple/list，形如 (hm32, hm64)
-    - 若是单张 heatmap，就当作 hm64
-    返回：(hm32 or None, hm64)；hm64 保证是 [B,1,H,W]
+    Unify the evidence-head outputs into (hm32_optional, hm64_required)
+    - If the output is a tuple/list, it looks like (hm32, hm64)
+    - If it is a single heatmap, treat it as hm64
+    Return (hm32 or None, hm64); hm64 is guaranteed to be [B,1,H,W]
     """
     if isinstance(hm_out, (tuple, list)):
         hm32, hm64 = hm_out
@@ -409,7 +409,7 @@ def train_one_epoch_joint(model, visual_tap, loader, optimizer, device,
     def compute_grad_cosine(model, loss_cls, loss_evi):
         model.zero_grad(set_to_none=True)
     
-        # 分类梯度
+        # classification gradients
         loss_cls.backward(retain_graph=True)
         grad_cls = []
         for p in model.fuser.parameters():
@@ -418,7 +418,7 @@ def train_one_epoch_joint(model, visual_tap, loader, optimizer, device,
         grad_cls = torch.cat(grad_cls)
         model.zero_grad(set_to_none=True)
     
-        # 证据梯度
+        # evidence gradients
         loss_evi.backward(retain_graph=True)
         grad_evi = []
         for p in model.fuser.parameters():
@@ -438,19 +438,19 @@ def train_one_epoch_joint(model, visual_tap, loader, optimizer, device,
         with torch.no_grad():
             grids = visual_tap(inputs["pixel_values"], inputs["image_grid_thw"])
 
-        logits, hm_out = model(grids)              # logits: [B], hm_out: (hm32, hm64) 或 hm64
+        logits, hm_out = model(grids)              # logits: [B], hm_out: (hm32, hm64) or hm64
         hm32, hm64 = _unpack_heatmap(hm_out)       # hm64: [B,1,H,W]
 
-        # 分类损失
+        # classification loss
         L_cls = bce_cls(logits, labels)
 
-        # 像素监督 (直接在 64×64 上对齐)
+        # pixel supervision (align directly at 64×64)
         Ht, Wt = hm64.shape[-2:]
         prob64 = torch.sigmoid(hm64)                               # [B,1,H,W]
         mask64 = F.interpolate(masks.unsqueeze(1).float(), size=(Ht, Wt),
                                mode="bilinear", align_corners=False).clamp(0,1)  # [B,1,H,W]
 
-        # 正负像素不均衡权重
+        # class-imbalance weighting for pixels
         with torch.no_grad():
             pos_pix = mask64.sum()
             tot_pix = mask64.numel()
@@ -459,7 +459,7 @@ def train_one_epoch_joint(model, visual_tap, loader, optimizer, device,
         bce_pix = nn.BCEWithLogitsLoss(pos_weight=pos_w)
         L_bce   = bce_pix(hm64, mask64)
 
-        # Dice 只在假图上计算
+        # compute Dice only on fake images
         pos_mask = (labels.view(-1,1,1,1) > 0.5).float()
         pp = prob64 * pos_mask
         gg = mask64 * pos_mask
@@ -469,10 +469,10 @@ def train_one_epoch_joint(model, visual_tap, loader, optimizer, device,
         valid  = (pos_mask.view(pos_mask.size(0), -1).sum(dim=1) > 0).float()
         L_dice = (dice_b * valid).sum() / (valid.sum() + 1e-6)
 
-        # 主证据损失
+        # main evidence loss
         L_evi = evi_alpha * L_bce + (1. - evi_alpha) * L_dice
 
-        # 稀疏 & 对比（可选）
+        # sparsity & contrast terms (optional)
         L_sparse = prob64.mean()
         real_idx = (labels < 0.5)
         fake_idx = (labels > 0.5)
@@ -485,11 +485,11 @@ def train_one_epoch_joint(model, visual_tap, loader, optimizer, device,
         if diagnose_grad:
             cosine = compute_grad_cosine(model, L_cls, L_evi)
             print(f"[DEBUG] Grad cosine (cls vs evi): {cosine:.3f}")
-            # 不更新权重，只观测方向
+            # do not update weights; observe the direction only
             optimizer.zero_grad(set_to_none=True)
             continue
-        # ====== 梯度夹角分析 ======
-        if step % 50 == 0:  # 每50步打印一次
+        # ====== Gradient-angle analysis ======
+        if step % 50 == 0:  # print once every 50 steps
             cosine = compute_grad_cosine(model, L_cls, L_evi)
             print(f"[DEBUG] Gradient cosine (cls vs evi): {cosine:.3f}")
         # ========================
@@ -517,19 +517,19 @@ def train_one_epoch_joint(model, visual_tap, loader, optimizer, device,
 
 def schedule_joint_weights(epoch, total_epochs):
     """
-    动态调度 λₑ（证据损失权重）和 evi_alpha（BCE:Dice 比例）
-    按阶段递增强化联合训练。
+    Dynamically schedule λₑ (evidence-loss weight) and evi_alpha (BCE:Dice ratio)
+    Stage-by-stage strengthening of joint training.
     """
-    if epoch <= total_epochs * 0.2:       # 前 20% epoch：分类主导
+    if epoch <= total_epochs * 0.2:       # first 20% of epochs: classification-driven
         λ_e = 0.4
         evi_alpha = 0.8
-    elif epoch <= total_epochs * 0.5:     # 中期平衡
+    elif epoch <= total_epochs * 0.5:     # mid phase: balanced
         λ_e = 0.6
         evi_alpha = 0.75
-    elif epoch <= total_epochs * 0.8:     # 后期强化证据
+    elif epoch <= total_epochs * 0.8:     # late phase: emphasize evidence
         λ_e = 0.7
         evi_alpha = 0.7
-    else:                                 # 收尾：微调阶段
+    else:                                 # final phase: fine-tuning
         λ_e = 0.5
         evi_alpha = 0.8
     return λ_e, evi_alpha
@@ -542,13 +542,14 @@ def train_joint_v2(model, visual_tap, dl_train, dl_val, optimizer, scheduler,
                    out_dir="outputs_lora_joint", csv_name="train_history_joint.csv",
                    early_stop_patience=3):
     """
-    主训练循环：动态调整 λₑ / evi_alpha，自动保存最佳 AUROC / IoU，按 epoch 追加写入 CSV，
-    并启用早停（AUROC 与 IoU 都无提升计 1 次，连续 early_stop_patience 次则停止）。
+    Main training loop: dynamically adjust λₑ / evi_alpha, automatically save the best AUROC / IoU,
+    append to CSV each epoch, and enable early stopping (count one strike whenever neither AUROC nor IoU
+    improves; stop after early_stop_patience consecutive strikes).
     """
     os.makedirs(out_dir, exist_ok=True)
     csv_path = os.path.join(out_dir, csv_name)
 
-    # 若 CSV 不存在，先写表头
+    # if the CSV does not exist yet, write the header first
     if not os.path.exists(csv_path):
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=[
@@ -566,7 +567,7 @@ def train_joint_v2(model, visual_tap, dl_train, dl_val, optimizer, scheduler,
     history = []
 
     for epoch in range(1, total_epochs + 1):
-        # 动态权重调度（你已有的函数）
+        # dynamic weight scheduling (the function you already have)
         λ_e, evi_alpha = schedule_joint_weights(epoch, total_epochs)
         print(f"\nEpoch {epoch}/{total_epochs} | λₑ={λ_e:.2f} | evi_alpha={evi_alpha:.2f} | lr={optimizer.param_groups[0]['lr']:.2e}")
 
@@ -587,7 +588,7 @@ def train_joint_v2(model, visual_tap, dl_train, dl_val, optimizer, scheduler,
               f"F1@best={m_cls['f1']:.4f}@thr={m_cls['thr_f1']:.2f} | "
               f"IoU={m_evi['mean_iou']:.4f} | Dice={m_evi['mean_dice']:.4f}")
 
-        # === 保存到 history（内存） ===
+        # === Save to the in-memory history ===
         row = {
             "epoch": int(epoch),
             "lambda_e": float(λ_e),
@@ -604,12 +605,12 @@ def train_joint_v2(model, visual_tap, dl_train, dl_val, optimizer, scheduler,
         }
         history.append(row)
 
-        # === 追加写入 CSV（每个 epoch 写一次） ===
+        # === Append to the CSV (once per epoch) ===
         with open(csv_path, "a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=list(row.keys()))
             writer.writerow(row)
 
-        # === 保存最佳模型 ===
+        # === Save the best models ===
         improved = False
         if m_cls["auroc"] > best_auc + 1e-6:
             best_auc = m_cls["auroc"]; best_auc_ep = epoch
@@ -623,7 +624,7 @@ def train_joint_v2(model, visual_tap, dl_train, dl_val, optimizer, scheduler,
             print(f"✔ Saved new best IoU={best_iou:.4f} @epoch {best_iou_ep}")
             improved = True
 
-        # === 早停逻辑：两个指标都没提升才 +1 ===
+        # === Early-stopping logic: increment only when neither metric improves ===
         if not improved:
             no_improve_counter += 1
             print(f"[EarlyStop] No improvement this epoch. Patience {no_improve_counter}/{early_stop_patience}")
@@ -656,7 +657,7 @@ def evaluate(model, visual_tap, data_loader, device):
 
     auroc = roc_auc_score(y_true, y_prob)
 
-    # 扫阈值
+    # sweep thresholds
     thrs = np.linspace(0.05, 0.95, 19)
     best_acc = best_f1 = -1.0
     thr_acc = thr_f1 = 0.5
@@ -689,7 +690,7 @@ def evaluate_evidence_iou(model, visual_tap, data_loader, device, thr=0.3, only_
         grids  = visual_tap(inputs["pixel_values"], inputs["image_grid_thw"])
         grids  = {k: v.float() for k,v in grids.items()}
 
-        _, hm_out = model(grids)                  # 可能是 (hm32, hm64) 或 hm64
+        _, hm_out = model(grids)                  # may be (hm32, hm64) or hm64
         _, hm64 = _unpack_heatmap(hm_out)         # [B,1,H,W]
 
         prob64 = torch.sigmoid(hm64)              # [B,1,H,W]
@@ -730,15 +731,15 @@ def evaluate_evidence_iou(model, visual_tap, data_loader, device, thr=0.3, only_
 # Main
 def main():
     ap = argparse.ArgumentParser()
-    # 数据
+    # data
     ap.add_argument("--data_root", default="//root/autodl-tmp/data")
     ap.add_argument("--train_ann", default="/root/autodl-tmp/data/trainval/train_idx.json")
     ap.add_argument("--val_ann",   default="/root/autodl-tmp/data/trainval/val_idx.json")
-    # 模型与路径
+    # models and paths
     ap.add_argument("--model_path", default="/root/autodl-tmp/models/Qwen2.5-VL-7B-Instruct/")
     ap.add_argument("--clsA_dir",   default="outputs_lora_cls")
     ap.add_argument("--out_dir",    default="outputs_lora_joint")
-    # 训练
+    # training
     ap.add_argument("--epochs", type=int, default=25)
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--grad_accum", type=int, default=8)
@@ -746,13 +747,13 @@ def main():
     ap.add_argument("--weight_decay", type=float, default=3e-4)
     ap.add_argument("--warmup_ratio", type=float, default=0.06)
     ap.add_argument("--min_lr_scale", type=float, default=0.1)
-    # 证据损失权重
+    # evidence-loss weights
     ap.add_argument("--evi_weight", type=float, default=1.0)
     ap.add_argument("--evi_alpha",  type=float, default=0.5, help="BCE:Dice mixing for evidence loss")
     ap.add_argument("--no_focal",   action="store_true")
     ap.add_argument("--sparse_w",   type=float, default=1e-4)
     ap.add_argument("--contrast_w", type=float, default=5e-3)
-    # 评估/可视化
+    # evaluation / visualization
     ap.add_argument("--diagnose_grad", action="store_true", help="Enable gradient conflict diagnosis mode")
     
     ap.add_argument("--eval_vis",   type=int, default=16)
@@ -775,7 +776,7 @@ def main():
     ds_val   = ForgeryJointDataset(args.val_ann,   data_root=args.data_root)
     print(f"Train: {len(ds_train)} | Val: {len(ds_val)}")
     
-    # 快速自检
+    # quick self-check
     for k in [0, len(ds_train)//2, len(ds_train)-1]:
         r = ds_train[k]
         print("TRAIN sample:", k, "| y=", r["label"], "| path=", r["path"], "| mask=", type(r["mask"]).__name__)
@@ -783,7 +784,7 @@ def main():
         r = ds_val[k]
         print("VAL   sample:", k, "| y=", r["label"], "| path=", r["path"], "| mask=", type(r["mask"]).__name__)
     
-    # 只初始化一次 processor
+    # initialize the processor only once
     processor = AutoProcessor.from_pretrained(args.model_path, local_files_only=True)
     def collate_fn(batch): 
         return collate_joint(batch, processor, fixed_res=448)
@@ -805,10 +806,10 @@ def main():
         for b, (inputs, labels, masks, _) in enumerate(dl):
             y = labels.numpy().astype(int)     # [B]
             if isinstance(masks, list):
-                m = torch.stack(masks, dim=0)  # 兼容老版
+                m = torch.stack(masks, dim=0)  # compatibility with the older format
             else:
                 m = masks                      # [B,H,W]
-            # 非零判定（原分辨率）
+            # non-zero check (original resolution)
             nz = (m.view(m.size(0), -1).sum(dim=1) > 0).numpy()
             n_fake         += int((y == 1).sum())
             n_fake_with_mask += int(((y == 1) & nz).sum())
@@ -818,8 +819,8 @@ def main():
     nf, nfm = sanity_count_nonzero_masks(dl_val, max_batches=50)
     print(f"[SANITY] val fake total={nf}, fake-with-nonzero-mask={nfm}, ratio={0 if nf==0 else nfm/nf:.3f}")
     
-    # === 构建模型 ===
-    # (1) 加载 Qwen + LoRA
+    # === Build the model ===
+    # (1) Load Qwen + LoRA
     base = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         args.model_path, torch_dtype=torch.bfloat16, device_map="auto",
         attn_implementation="flash_attention_2"
@@ -830,14 +831,14 @@ def main():
         p.requires_grad = False
     qwen.eval()
     
-    # (2) 初始化 visual_tap —— 注意现在 qwen 已经定义！
+    # (2) Initialize visual_tap — note that qwen is already defined now!
     visual_tap = QwenVisualTap(qwen.visual, layers=(15,23,31)).to(device)
     
-    # (3) 构建 forensic heads
+    # (3) Build the forensic heads
     heads = ForensicJoint(fuse_in_ch=1280, fuse_out_ch=512, layers=(15,23,31)).to(device)
     init_joint_heads_with_priors(heads, p1_prior=0.5, pix_prior=0.03)
     
-    # 直接从分类阶段 ckpt 加载 fuser/cls（因 layers 相同=3路，形状能对上）
+    # Load fuser/cls directly from the classification-stage checkpoint (shapes match because the layer count is the same — 3 branches)
     cls_ckpt = "/root/script/outputs_clsA/best_by_AUROC.pt"
     sd_all = torch.load(cls_ckpt, map_location="cpu"); sd_all = sd_all.get("state_dict", sd_all)
     sd = heads.state_dict(); loaded = 0
@@ -847,7 +848,7 @@ def main():
     heads.load_state_dict(sd, strict=False)
     print(f"[LOAD] Warmed fuser/cls from {cls_ckpt} | loaded={loaded} tensors")
     
-    # === 训练（保留你现有的损失与超参）===
+    # === Training (keep your existing losses and hyperparameters) ===
     optimizer = torch.optim.AdamW(heads.parameters(), lr=args.base_lr, weight_decay=args.weight_decay)
     steps_per_epoch = math.ceil(len(dl_train) / max(1, args.grad_accum))
     total_steps = args.epochs * steps_per_epoch
@@ -859,9 +860,9 @@ def main():
         heads, visual_tap, dl_train, dl_val, optimizer, scheduler,
         device, total_epochs=args.epochs,
         grad_accum=args.grad_accum, log_interval=50,
-        out_dir=args.out_dir,                     # ✅ 保存模型与CSV到这个目录
-        csv_name="train_history_joint.csv",       # ✅ CSV 文件名
-        early_stop_patience=3                     # ✅ 连续3个epoch无提升则早停
+        out_dir=args.out_dir,                     # ✅ Save models and the CSV to this directory
+        csv_name="train_history_joint.csv",       # ✅ CSV file name
+        early_stop_patience=3                     # ✅ Stop early after three consecutive epochs without improvement
     )
 
 if __name__ == "__main__":
