@@ -59,7 +59,7 @@ class ForgeryJointValDataset(Dataset):
             y = int(rec.get("label", 0))
             mp = rec.get("mask_path", "")
 
-            # 解析图片
+           
             p = Path(img_rel)
             if not p.is_absolute():
                 p = (self.root / img_rel).resolve()
@@ -74,7 +74,7 @@ class ForgeryJointValDataset(Dataset):
             if p is None or not p.exists():
                 continue
 
-            # 掩码（假图：路径；真图：尺寸，全0就行）
+      
             if y == 1:
                 mask_p = None
                 if not (isinstance(mp, str) and "x" in mp.lower()):
@@ -115,7 +115,7 @@ class ForgeryJointValDataset(Dataset):
             m = Image.new("L", (W, H), 0)
         return {"image": img, "label": y, "mask": m, "path": rec["path"]}
 
-# Collate（固定 448）
+
 def collate_joint_test(batch, processor, fixed_res=448):
     messages, masks, labels, paths, vis_imgs = [], [], [], [], []
     for rec in batch:
@@ -146,7 +146,7 @@ def collate_joint_test(batch, processor, fixed_res=448):
     masks  = torch.from_numpy(np.stack(masks, axis=0))  # [B,H,W] in {0,1}
     return inputs, labels, masks, paths, vis_imgs
 
-# Visual Tap（与训练一致）
+# Visual Tap
 class QwenVisualTap(nn.Module):
     def __init__(self, visual, layers=(7,15,23,31)):
         super().__init__()
@@ -186,7 +186,7 @@ class QwenVisualTap(nn.Module):
             grid_dict[i] = grid.float()
         return grid_dict
 
-# Heads 与联训一致
+# Heads 
 class MiniFuse(nn.Module):
     def __init__(self, in_ch=1280, n_layers=4, mid=512, out=512):
         super().__init__()
@@ -241,7 +241,7 @@ class ForensicJoint(nn.Module):
         heatmap_logits = self.evi(fused)  # [B,H,W]
         return logits, heatmap_logits
 
-# 测分类
+
 @torch.no_grad()
 def eval_classification(model, visual_tap, dl, device, thr_cls=0.5):
     model.eval()
@@ -270,7 +270,7 @@ def eval_classification(model, visual_tap, dl, device, thr_cls=0.5):
         "f1":    float(f1_score(y_true, y_pred)),
     }
 
-# 测证据 
+
 @torch.no_grad()
 def eval_evidence(model, visual_tap, dl, device, thr_map=0.5, only_fake=True, skip_empty_gt=True):
     model.eval()
@@ -335,7 +335,7 @@ def eval_evidence(model, visual_tap, dl, device, thr_map=0.5, only_fake=True, sk
         "mean_dice": float(dice_num / dice_den),
     }
 
-# 可视化：随机抽 k 张（原图叠热图，红色）
+
 @torch.no_grad()
 def visualize_random(model, visual_tap, dl, device, out_dir, k=3):
     os.makedirs(out_dir, exist_ok=True)
@@ -382,16 +382,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_path", default="/root/models/Qwen2.5-VL-7B-Instruct/")
     ap.add_argument("--ckpt",       default="/root/script/outputs_joint/best_by_IoU_joint.pt")
-    ap.add_argument("--ann",        default="/root/data/trainval/val_idx.json")  # 用有掩码的 val
+    ap.add_argument("--ann",        default="/root/data/trainval/val_idx.json")  
     ap.add_argument("--data_root",  default="/root/data")
     ap.add_argument("--out_dir",    default="/root/script/test_out")
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--seed",       type=int, default=42)
 
-    ap.add_argument("--thr_cls",    type=float, default=0.5)  # 分类阈值
-    ap.add_argument("--thr_map",    type=float, default=0.3)  # 热力图二值化阈值
-    ap.add_argument("--only_fake",  action="store_true")      # 只在假图上评 IoU/Dice
-    ap.add_argument("--vis_n",      type=int, default=3)      # 可视化数量
+    ap.add_argument("--thr_cls",    type=float, default=0.5) 
+    ap.add_argument("--thr_map",    type=float, default=0.3) 
+    ap.add_argument("--only_fake",  action="store_true")     
+    ap.add_argument("--vis_n",      type=int, default=3)      
     args = ap.parse_args()
 
     set_seed(args.seed)
@@ -402,7 +402,7 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    # 数据
+
     processor = AutoProcessor.from_pretrained(args.model_path, local_files_only=True)
     ds_test   = ForgeryJointValDataset(args.ann, data_root=args.data_root)
     dl_test   = DataLoader(
@@ -410,7 +410,7 @@ def main():
         pin_memory=True, collate_fn=lambda b: collate_joint_test(b, processor, 448)
     )
 
-    # 模型（冻结 Qwen，只跑头）
+
     qwen = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         args.model_path, torch_dtype=torch.bfloat16, device_map="auto",
         attn_implementation="flash_attention_2"
@@ -422,18 +422,18 @@ def main():
     heads = ForensicJoint(fuse_in_ch=1280, fuse_out_ch=512, layers=(7,15,23,31)).to(device)
     ckpt = torch.load(args.ckpt, map_location="cpu")
     sd   = ckpt.get("state_dict", ckpt)
-    heads.load_state_dict(sd, strict=False)  # 用 strict=False 更稳妥
+    heads.load_state_dict(sd, strict=False)  
     heads.eval().to(device)
 
-    # 分类评估（无温度）
+ 
     cls_metrics = eval_classification(heads, visual_tap, dl_test, device, thr_cls=args.thr_cls)
-    # 证据评估（IoU/Dice）
+
     evi_metrics = eval_evidence(heads, visual_tap, dl_test, device, thr_map=args.thr_map, only_fake=args.only_fake)
 
-    # 可视化
+
     visualize_random(heads, visual_tap, dl_test, device, Path(args.out_dir)/"vis", k=args.vis_n)
 
-    # 保存结果
+
     out_json = {
         "cls": cls_metrics,
         "evidence": evi_metrics,
