@@ -13,7 +13,7 @@ from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 from peft import LoraConfig, get_peft_model, PeftModel, TaskType
 
 
-from classanddetect import (
+from stage2_joint import (
     ForgeryJointDataset, collate_joint,
     ForensicJoint,                # fuser + cls + evidence heads
     evaluate, 
